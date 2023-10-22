@@ -654,12 +654,12 @@ pub const Editor = struct {
             self.reset();
             self.stripStyles();
 
-            const prompt_lines = std.math.max(self.currentPromptMetrics().line_metrics.container.items.len, 1) - 1;
+            const prompt_lines = @max(self.currentPromptMetrics().line_metrics.container.items.len, 1) - 1;
             for (0..prompt_lines) |_| {
                 try stderr.writeAll("\n");
             }
 
-            try vtMoveRelative(-@intCast(i64, prompt_lines), 0);
+            try vtMoveRelative(-@as(i64, @intCast(prompt_lines)), 0);
             _ = self.setOrigin(true);
 
             self.history_cursor = self.history.container.items.len;
@@ -795,7 +795,7 @@ pub const Editor = struct {
         var u8buffer = std.ArrayList(u8).init(self.allocator);
         for (self.buffer.container.items[0..index]) |code_point| {
             var u8buf = [4]u8{ 0, 0, 0, 0 };
-            const length = try std.unicode.utf8Encode(@intCast(u21, code_point), &u8buf);
+            const length = try std.unicode.utf8Encode(@intCast(code_point), &u8buf);
             try u8buffer.appendSlice(u8buf[0..length]);
         }
 
@@ -834,7 +834,7 @@ pub const Editor = struct {
 
     pub fn insertCodePoint(self: *Self, code_point: u32) void {
         var buf = [_]u8{ 0, 0, 0, 0 };
-        const length = std.unicode.utf8Encode(@intCast(u21, code_point), &buf) catch {
+        const length = std.unicode.utf8Encode(@intCast(code_point), &buf) catch {
             return;
         };
         self.pending_chars.container.appendSlice(buf[0..length]) catch {
@@ -1023,14 +1023,14 @@ pub const Editor = struct {
                 .CSIExpectParameter, .CSIExpectIntermediate, .CSIExpectFinal => {
                     if (self.input_state == .CSIExpectParameter) {
                         if (code_point >= 0x30 and code_point <= 0x3f) { // '0123456789:;<=>?'
-                            try csi.parameter_bytes.append(@intCast(u8, code_point));
+                            try csi.parameter_bytes.append(@intCast(code_point));
                             continue;
                         }
                         self.input_state = .CSIExpectIntermediate;
                     }
                     if (self.input_state == .CSIExpectIntermediate) {
                         if (code_point >= 0x20 and code_point <= 0x2f) { // ' !"#$%&\'()*+,-./'
-                            try csi.intermediate_bytes.append(@intCast(u8, code_point));
+                            try csi.intermediate_bytes.append(@intCast(code_point));
                             continue;
                         }
                         self.input_state = .CSIExpectFinal;
@@ -1057,7 +1057,7 @@ pub const Editor = struct {
 
                         var modifiers: CSIMod = .None;
                         if (param1 != 0) {
-                            modifiers = @intToEnum(CSIMod, @intCast(u8, param1 - 1));
+                            modifiers = @enumFromInt(@as(u8, @intCast(param1 - 1)));
                         }
 
                         if (is_in_paste and code_point != '~' and param1 != 201) {
@@ -1071,11 +1071,11 @@ pub const Editor = struct {
                             continue;
                         }
                         if (!(code_point >= 0x40 and code_point <= 0x7f)) {
-                            logger.debug("Invalid CSI: {x:02} ({c})", .{ code_point, @intCast(u8, code_point) });
+                            logger.debug("Invalid CSI: {x:02} ({c})", .{ code_point, @as(u8, @intCast(code_point)) });
                             continue;
                         }
 
-                        csi_final = @intCast(u8, code_point);
+                        csi_final = @intCast(code_point);
                         csi_parameters.clearAndFree();
                         csi.parameter_bytes.clearAndFree();
                         csi.intermediate_bytes.clearAndFree();
@@ -1159,7 +1159,7 @@ pub const Editor = struct {
                                 continue;
                             },
                             else => {
-                                logger.debug("Unhandled final: {x:02} ({c})", .{ code_point, @intCast(u8, code_point) });
+                                logger.debug("Unhandled final: {x:02} ({c})", .{ code_point, @as(u8, @intCast(code_point)) });
                                 continue;
                             },
                         }
@@ -1436,9 +1436,9 @@ pub const Editor = struct {
         const should_print_caret = code_point < 64 and should_print_masked;
         if (should_print_caret) {
             try buffer.append('^');
-            try buffer.append(@intCast(u8, code_point + 64));
+            try buffer.append(@intCast(code_point + 64));
         } else {
-            const c = @intCast(u21, code_point);
+            const c: u21 = @intCast(code_point);
             const length = try std.unicode.utf8CodepointSequenceLength(c);
             try buffer.appendNTimes(0, length);
             _ = try std.unicode.utf8Encode(c, buffer.items[buffer.items.len - length .. buffer.items.len]);
