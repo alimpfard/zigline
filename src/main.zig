@@ -165,7 +165,7 @@ pub const StringMetrics = struct {
         visible_length: usize = 0,
         bit_length: ?usize = null,
 
-        pub fn total_length(self: *@This()) usize {
+        pub fn total_length(self: @This()) usize {
             return self.length;
         }
     };
@@ -186,14 +186,14 @@ pub const StringMetrics = struct {
         self.line_metrics.deinit();
     }
 
-    pub fn lines_with_addition(self: *const Self, offset: Self, column_width: usize) usize {
+    pub fn lines_with_addition(self: Self, offset: Self, column_width: usize) usize {
         _ = self;
         _ = offset;
         _ = column_width;
         return 0;
     }
 
-    pub fn offset_with_addition(self: *const Self, offset: Self, column_width: usize) usize {
+    pub fn offset_with_addition(self: Self, offset: Self, column_width: usize) usize {
         _ = self;
         _ = offset;
         _ = column_width;
@@ -223,7 +223,9 @@ pub const Key = struct {
         Alt = 1,
     } = .Alt,
 
-    pub fn equals(self: *const @This(), other: @This()) bool {
+    const Self = @This();
+
+    pub fn equals(self: Self, other: Self) bool {
         return self.code_point == other.code_point and self.modifiers == other.modifiers;
     }
 };
@@ -232,8 +234,10 @@ const KeyCallbackEntry = struct {
     sequence: ArrayList(Key),
     callback: *const fn (*Editor) bool,
 
-    pub fn init(allocator: Allocator, sequence: []const Key, f: *const fn (*Editor) bool) @This() {
-        var self = @This(){
+    const Self = @This();
+
+    pub fn init(allocator: Allocator, sequence: []const Key, f: *const fn (*Editor) bool) Self {
+        var self = Self{
             .sequence = ArrayList(Key).init(allocator),
             .callback = f,
         };
@@ -241,7 +245,7 @@ const KeyCallbackEntry = struct {
         return self;
     }
 
-    pub fn deinit(self: *@This()) void {
+    pub fn deinit(self: *Self) void {
         self.sequence.deinit();
     }
 };
@@ -462,7 +466,7 @@ pub const Editor = struct {
             self.ending.deinit();
         }
 
-        pub fn containsUpToOffset(self: *const @This(), other: @This(), offset: usize) bool {
+        pub fn containsUpToOffset(self: @This(), other: @This(), offset: usize) bool {
             _ = self;
             _ = other;
             _ = offset;
