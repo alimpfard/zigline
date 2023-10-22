@@ -100,7 +100,7 @@ pub const Style = struct {
     };
 
     pub fn resetStyle() Self {
-        return Self{};
+        return .{};
     }
 
     pub fn unifiedWith(self: Self, other: Self, prefer_other: bool) Self {
@@ -177,7 +177,7 @@ pub const StringMetrics = struct {
     const Self = @This();
 
     pub fn init(allocator: Allocator) Self {
-        return Self{
+        return .{
             .line_metrics = ArrayList(LineMetrics).init(allocator),
         };
     }
@@ -255,7 +255,7 @@ pub const KeyCallbackMachine = struct {
     const Self = @This();
 
     pub fn init(allocator: Allocator) Self {
-        return Self{
+        return .{
             .key_callbacks = ArrayList(KeyCallbackEntry).init(allocator),
             .current_matching_keys = ArrayList([]const Key).init(allocator),
         };
