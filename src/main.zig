@@ -9,6 +9,8 @@ const ArrayList = sane.ArrayList;
 const AutoHashMap = sane.AutoHashMap;
 const Queue = sane.Queue;
 
+const logger = std.log.scoped(.zigline);
+
 // FIXME: Windows :P
 fn getTermios() !std.os.termios {
     return try std.os.tcgetattr(std.os.STDIN_FILENO);
@@ -1069,7 +1071,7 @@ pub const Editor = struct {
                             continue;
                         }
                         if (!(code_point >= 0x40 and code_point <= 0x7f)) {
-                            std.log.debug("zigline: Invalid CSI: {x:02} ({c})", .{ code_point, @intCast(u8, code_point) });
+                            logger.debug("Invalid CSI: {x:02} ({c})", .{ code_point, @intCast(u8, code_point) });
                             continue;
                         }
 
@@ -1153,11 +1155,11 @@ pub const Editor = struct {
                                         continue;
                                     }
                                 }
-                                std.log.debug("zigline: Unhandled '~': {}", .{param1});
+                                logger.debug("Unhandled '~': {}", .{param1});
                                 continue;
                             },
                             else => {
-                                std.log.debug("zigline: Unhandled final: {x:02} ({c})", .{ code_point, @intCast(u8, code_point) });
+                                logger.debug("Unhandled final: {x:02} ({c})", .{ code_point, @intCast(u8, code_point) });
                                 continue;
                             },
                         }
