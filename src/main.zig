@@ -133,27 +133,27 @@ pub const Style = struct {
         self.is_empty = self.is_empty and other.is_empty;
     }
 
-    pub fn set_underline(self: *Self, underline: bool) void {
+    pub fn setUnderline(self: *Self, underline: bool) void {
         self.underline = underline;
         self.is_empty = false;
     }
 
-    pub fn set_bold(self: *Self, bold: bool) void {
+    pub fn setBold(self: *Self, bold: bool) void {
         self.bold = bold;
         self.is_empty = false;
     }
 
-    pub fn set_italic(self: *Self, italic: bool) void {
+    pub fn setItalic(self: *Self, italic: bool) void {
         self.italic = italic;
         self.is_empty = false;
     }
 
-    pub fn set_background(self: *Self, background: Color) void {
+    pub fn setBackground(self: *Self, background: Color) void {
         self.background = background;
         self.is_empty = false;
     }
 
-    pub fn set_foreground(self: *Self, foreground: Color) void {
+    pub fn setForeground(self: *Self, foreground: Color) void {
         self.foreground = foreground;
         self.is_empty = false;
     }
@@ -165,7 +165,7 @@ pub const StringMetrics = struct {
         visible_length: usize = 0,
         bit_length: ?usize = null,
 
-        pub fn total_length(self: @This()) usize {
+        pub fn totalLength(self: @This()) usize {
             return self.length;
         }
     };
@@ -186,14 +186,14 @@ pub const StringMetrics = struct {
         self.line_metrics.deinit();
     }
 
-    pub fn lines_with_addition(self: Self, offset: Self, column_width: usize) usize {
+    pub fn linesWithAddition(self: Self, offset: Self, column_width: usize) usize {
         _ = self;
         _ = offset;
         _ = column_width;
         return 0;
     }
 
-    pub fn offset_with_addition(self: Self, offset: Self, column_width: usize) usize {
+    pub fn offsetWithAddition(self: Self, offset: Self, column_width: usize) usize {
         _ = self;
         _ = offset;
         _ = column_width;
@@ -1296,7 +1296,7 @@ pub const Editor = struct {
     fn refreshDisplay(self: *Self) !void {
         var buffered_output = std.io.bufferedWriter(std.io.getStdErr().writer());
         defer {
-            self.shown_lines = self.currentPromptMetrics().lines_with_addition(self.cached_buffer_metrics, self.num_columns);
+            self.shown_lines = self.currentPromptMetrics().linesWithAddition(self.cached_buffer_metrics, self.num_columns);
             _ = buffered_output.flush() catch {};
         }
 
