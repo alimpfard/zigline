@@ -481,7 +481,7 @@ pub const Editor = struct {
     };
     const DeferredAction = union(enum) {
         HandleResizeEvent: bool, // reset_origin
-        TryUpdateOnce: u8, // single byte read from stdin
+        TryUpdateOnce: u8, // dummy
     };
 
     allocator: Allocator,
@@ -556,6 +556,8 @@ pub const Editor = struct {
 
     queue_cond_mutex: Mutex = .{},
     queue_condition: Condition = .{},
+    logic_cond_mutex: Mutex = .{},
+    logic_condition: Condition = .{},
     loop_queue: Queue(LoopExitCode),
     deferred_action_queue: Queue(DeferredAction),
     signal_queue: Queue(Signal),
@@ -603,6 +605,10 @@ pub const Editor = struct {
         self.paste_buffer.deinit();
         self.drawn_spans.deinit();
         self.current_spans.deinit();
+        self.loop_queue.deinit();
+        self.signal_queue.deinit();
+        self.deferred_action_queue.deinit();
+        self.callback_machine.deinit();
     }
 
     pub fn reFetchDefaultTermios(self: *Self) void {
@@ -669,7 +675,7 @@ pub const Editor = struct {
             self.control_thread = try Thread.spawn(.{}, Self.controlThreadMain, .{self});
 
             if (self.incomplete_data.container.items.len != 0) {
-                try self.deferred_action_queue.enqueue(DeferredAction{ .TryUpdateOnce = self.incomplete_data.container.orderedRemove(0) });
+                try self.deferred_action_queue.enqueue(DeferredAction{ .TryUpdateOnce = 0 });
                 self.queue_condition.broadcast();
             }
 
@@ -696,11 +702,12 @@ pub const Editor = struct {
                             self.handleResizeEvent(action.HandleResizeEvent);
                         },
                         .TryUpdateOnce => {
-                            try self.incomplete_data.container.append(action.TryUpdateOnce);
                             try self.tryUpdateOnce();
                         },
                     }
                 }
+
+                self.logic_condition.broadcast();
 
                 while (!self.loop_queue.isEmpty()) {
                     const code = self.loop_queue.dequeue();
@@ -723,24 +730,32 @@ pub const Editor = struct {
 
     fn controlThreadMain(self: *Self) void {
         var stdin = std.io.getStdIn();
-        var buffer = [1]u8{0};
-        while (true) {
-            // FIXME: We shouldn't actually read here, but rather use select() or poll()
-            //        However, Zig's interface to poll() reads from the fd (!), which is not what we want.
-            //        And there's no select() interface at all, so we're stuck with this for now.
-            const size = stdin.read(&buffer) catch |err| {
-                self.input_error = err;
+        var pollfd: std.os.system.pollfd = undefined;
+        pollfd.fd = stdin.handle;
+        pollfd.events = std.os.system.POLL.IN;
+        pollfd.revents = 0;
+        var pollfds = [_]std.os.system.pollfd{pollfd};
+
+        self.logic_cond_mutex.lock();
+
+        while (self.is_editing) {
+            const rc = std.os.system.poll(&pollfds, 1, std.math.maxInt(i32));
+            if (rc < 0) {
+                self.input_error = std.os.errno(rc);
                 self.loop_queue.enqueue(.Exit) catch {
                     break;
                 };
                 self.queue_condition.broadcast();
                 break;
-            };
-
-            if (size == 1) {
-                self.deferred_action_queue.enqueue(DeferredAction{ .TryUpdateOnce = buffer[0] }) catch {};
             }
-            self.queue_condition.broadcast();
+
+            if (rc == 1 and pollfds[0].revents & std.os.system.POLL.IN != 0) {
+                self.deferred_action_queue.enqueue(DeferredAction{ .TryUpdateOnce = 0 }) catch {};
+                self.queue_condition.broadcast();
+                // Wait for the main thread to process the event, any further input between now and then will be
+                // picked up either immediately, or in the next cycle.
+                self.logic_condition.wait(&self.logic_cond_mutex);
+            }
         }
     }
 
@@ -793,6 +808,8 @@ pub const Editor = struct {
 
     pub fn getBufferedLineUpTo(self: *Self, index: usize) ![]const u8 {
         var u8buffer = std.ArrayList(u8).init(self.allocator);
+        defer u8buffer.deinit();
+
         for (self.buffer.container.items[0..index]) |code_point| {
             var u8buf = [4]u8{ 0, 0, 0, 0 };
             const length = try std.unicode.utf8Encode(@intCast(code_point), &u8buf);
@@ -944,12 +961,11 @@ pub const Editor = struct {
         defer self.prohibit_input_processing = false;
 
         var keybuf = [16]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
-        var nread: usize = 0;
 
         var stdin = std.io.getStdIn();
 
         if (self.incomplete_data.container.items.len == 0) {
-            nread = stdin.read(&keybuf) catch |err| {
+            const nread = stdin.read(&keybuf) catch |err| {
                 // Zig eats EINTR, so we'll have to delay resize handling until the next read.
                 self.finished = true;
                 self.input_error = err;
