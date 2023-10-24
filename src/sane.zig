@@ -52,7 +52,7 @@ fn DeinitingArrayList(comptime T: type, comptime deinit_fn: anytype) type {
         }
 
         // ffs zig
-        pub fn size(self: *Self) usize {
+        pub fn size(self: Self) usize {
             return self.container.items.len;
         }
     };
@@ -107,7 +107,7 @@ pub fn Queue(comptime T: type) type {
             return self.container.container.orderedRemove(0);
         }
 
-        pub fn isEmpty(self: *Self) bool {
+        pub fn isEmpty(self: Self) bool {
             return self.container.container.items.len == 0;
         }
     };

@@ -165,7 +165,6 @@ pub const StringMetrics = struct {
     pub const LineMetrics = struct {
         length: usize = 0,
         visible_length: usize = 0,
-        bit_length: ?usize = null,
 
         pub fn totalLength(self: @This()) usize {
             return self.length;
@@ -189,21 +188,35 @@ pub const StringMetrics = struct {
     }
 
     pub fn linesWithAddition(self: Self, offset: Self, column_width: usize) usize {
-        _ = self;
-        _ = offset;
-        _ = column_width;
-        return 0;
+        var lines: usize = 0;
+
+        for (self.line_metrics.container.items[0 .. self.line_metrics.size() - 1]) |line| {
+            lines += (line.totalLength() + column_width) / column_width;
+        }
+
+        var last = self.line_metrics.container.items[self.line_metrics.size() - 1].totalLength();
+        last += offset.line_metrics.container.items[0].totalLength();
+        lines += (last + column_width) / column_width;
+        for (offset.line_metrics.container.items[1..]) |line| {
+            lines += (line.totalLength() + column_width) / column_width;
+        }
+
+        return lines;
     }
 
     pub fn offsetWithAddition(self: Self, offset: Self, column_width: usize) usize {
-        _ = self;
-        _ = offset;
-        _ = column_width;
-        return 0;
+        if (offset.line_metrics.size() > 1) {
+            return offset.line_metrics.container.items[offset.line_metrics.size() - 1].totalLength() % column_width;
+        }
+
+        var last = self.line_metrics.container.items[offset.line_metrics.size() - 1].totalLength();
+        last += offset.line_metrics.container.items[0].totalLength();
+
+        return last % column_width;
     }
 
-    pub fn reset(self: *Self) void {
-        self.line_metrics.clearAndFree();
+    pub fn reset(self: *Self) !void {
+        self.line_metrics.container.clearAndFree();
         self.total_length = 0;
         self.max_line_length = 0;
         try self.line_metrics.container.append(LineMetrics{});
@@ -452,6 +465,13 @@ pub const Editor = struct {
         CSIExpectIntermediate,
         CSIExpectFinal,
     };
+    const VTState = enum {
+        Free,
+        Escape,
+        Bracket,
+        BracketArgsSemi,
+        Title,
+    };
     const DrawnSpans = struct {
         starting: AutoHashMap(u32, std.AutoHashMap(u32, Style)),
         ending: AutoHashMap(u32, std.AutoHashMap(u32, Style)),
@@ -609,6 +629,8 @@ pub const Editor = struct {
         self.signal_queue.deinit();
         self.deferred_action_queue.deinit();
         self.callback_machine.deinit();
+        self.cached_buffer_metrics.deinit();
+        self.cached_prompt_metrics.deinit();
     }
 
     pub fn reFetchDefaultTermios(self: *Self) void {
@@ -657,7 +679,7 @@ pub const Editor = struct {
             }
 
             try self.setPrompt(prompt);
-            self.reset();
+            try self.reset();
             self.stripStyles();
 
             const prompt_lines = @max(self.currentPromptMetrics().line_metrics.container.items.len, 1) - 1;
@@ -824,23 +846,125 @@ pub const Editor = struct {
             self.old_prompt_metrics = self.cached_prompt_metrics;
         }
         self.cached_prompt_valid = false;
-        self.cached_prompt_metrics = Editor.actualRenderedStringMetrics(prompt);
+        self.cached_prompt_metrics.deinit();
+        self.cached_prompt_metrics = try self.actualRenderedStringMetrics(prompt);
         self.new_prompt.container.clearRetainingCapacity();
         try self.new_prompt.container.appendSlice(prompt);
     }
 
-    pub fn actualRenderedStringMetrics(string: []const u8) StringMetrics {
-        _ = string;
-        return undefined;
+    fn actualRenderedStringLengthStep(
+        metrics: *StringMetrics,
+        current_line: *StringMetrics.LineMetrics,
+        c: u32,
+        next_c: u32,
+        state: VTState,
+    ) !VTState {
+        switch (state) {
+            .Free => {
+                if (c == 0x1b) {
+                    return .Escape;
+                }
+                if (c == '\r') {
+                    current_line.length = 0;
+                    if (metrics.line_metrics.size() != 0) {
+                        metrics.line_metrics.container.items[metrics.line_metrics.size() - 1] = .{};
+                    }
+                    return state;
+                }
+                if (c == '\n') {
+                    try metrics.line_metrics.container.append(current_line.*);
+                    current_line.length = 0;
+                    return state;
+                }
+                current_line.length += 1;
+                metrics.total_length += 1;
+                return state;
+            },
+            .Escape => {
+                if (c == ']') {
+                    if (next_c == '0') {
+                        return .Title;
+                    }
+                    return state;
+                }
+                if (c == '[') {
+                    return .Bracket;
+                }
+                return state;
+            },
+            .Bracket => {
+                if (c >= '0' and c <= '9') {
+                    return .BracketArgsSemi;
+                }
+                return state;
+            },
+            .BracketArgsSemi => {
+                if (c == ';') {
+                    return .Bracket;
+                }
+                if (c >= '0' and c <= '9') {
+                    return state;
+                }
+                return .Free;
+            },
+            .Title => {
+                if (c == 7) {
+                    return .Free;
+                }
+                return state;
+            },
+        }
     }
 
-    pub fn actualRenderedUnicodeStringMetrics(string: []const u32) StringMetrics {
-        _ = string;
-        return undefined;
+    pub fn actualRenderedStringMetrics(self: *Self, string: []const u8) !StringMetrics {
+        var metrics = StringMetrics.init(self.allocator);
+        var current_line = StringMetrics.LineMetrics{};
+
+        var state: VTState = .Free;
+
+        for (0..string.len) |i| {
+            const c = string[i];
+            var next_c: u32 = 0;
+            if (i + 1 < string.len) {
+                next_c = string[i + 1];
+            }
+            state = try actualRenderedStringLengthStep(&metrics, &current_line, c, next_c, state);
+        }
+
+        try metrics.line_metrics.container.append(current_line);
+        for (metrics.line_metrics.container.items) |line_metric| {
+            metrics.max_line_length = @max(line_metric.totalLength(), metrics.max_line_length);
+        }
+
+        return metrics;
+    }
+
+    pub fn actualRenderedUnicodeStringMetrics(self: *Self, string: []const u32) !StringMetrics {
+        var metrics = StringMetrics.init(self.allocator);
+        var current_line = StringMetrics.LineMetrics{};
+
+        var state: VTState = .Free;
+
+        for (0..string.len) |i| {
+            const c = string[i];
+            var next_c: u32 = 0;
+            if (i + 1 < string.len) {
+                next_c = string[i + 1];
+            }
+            state = try actualRenderedStringLengthStep(&metrics, &current_line, c, next_c, state);
+        }
+
+        try metrics.line_metrics.container.append(current_line);
+        for (metrics.line_metrics.container.items) |line_metric| {
+            metrics.max_line_length = @max(line_metric.totalLength(), metrics.max_line_length);
+        }
+
+        return metrics;
     }
 
     pub fn clearLine(self: *Self) void {
         _ = self;
+        _ = std.io.getStdErr().write("\r\x1b[K") catch unreachable;
     }
 
     pub fn insertString(self: *Self, string: []const u8) void {
@@ -895,8 +1019,10 @@ pub const Editor = struct {
     }
 
     fn setDefaultKeybinds(self: *Self) !void {
-        // self.registerCharInputCallback(ctrl('N'), self.search_forwards);
         try self.registerCharInputCallback('\n', &Self.finish);
+        try self.registerCharInputCallback(ctrl('H'), &Self.eraseCharacterBackwards);
+        // DEL, some terminals send this instead of ctrl('H')
+        try self.registerCharInputCallback(127, &Self.eraseCharacterBackwards);
     }
 
     fn registerKeyInputCallback(self: *Self, key: Key, c: *const fn (*Editor) bool) !void {
@@ -918,15 +1044,33 @@ pub const Editor = struct {
     }
 
     fn vtMoveAbsolute(self: *Self, row: usize, col: usize, output_stream: anytype) !void {
-        _ = output_stream;
         _ = self;
-        _ = row;
-        _ = col;
+        _ = try output_stream.writer().print("\x1b[{d};{d}H", .{ row, col });
     }
 
     fn vtClearToEndOfLine(self: *Self, output_stream: anytype) !void {
-        _ = output_stream;
         _ = self;
+        _ = try output_stream.write("\x1b[K");
+    }
+
+    fn vtClearLines(self: *Self, above: usize, below: usize, output_stream: anytype) !void {
+        if (above + below == 0) {
+            return self.clearLine();
+        }
+
+        // Go down below lines...
+        var writer = output_stream.writer();
+        if (below > 0) {
+            try writer.print("\x1b[{d}B", .{below});
+        }
+
+        // ...and clear lines going up.
+        for (0..above + below) |i| {
+            try writer.print("\x1b[2K", .{});
+            if (i != 1) {
+                try writer.print("\x1b[A", .{});
+            }
+        }
     }
 
     fn tryUpdateOnce(self: *Self) !void {
@@ -1117,7 +1261,7 @@ pub const Editor = struct {
                                 if (modifiers == .Alt or modifiers == .Ctrl) {
                                     // TODO: self.cursorLeftWord();
                                 } else {
-                                    // TODO: self.cursorLeftCharacter();
+                                    _ = self.cursorLeftCharacter();
                                 }
                                 continue;
                             },
@@ -1125,7 +1269,7 @@ pub const Editor = struct {
                                 if (modifiers == .Alt or modifiers == .Ctrl) {
                                     // TODO: self.cursorRightWord();
                                 } else {
-                                    // TODO: self.cursorRightCharacter();
+                                    _ = self.cursorRightCharacter();
                                 }
                                 continue;
                             },
@@ -1141,7 +1285,7 @@ pub const Editor = struct {
                                 if (modifiers == .Ctrl) {
                                     // TODO: self.eraseAlnumWordBackwards();
                                 } else {
-                                    // TODO: self.eraseCharacterBackwards();
+                                    _ = self.eraseCharacterBackwards();
                                 }
                                 continue;
                             },
@@ -1150,7 +1294,7 @@ pub const Editor = struct {
                                     if (modifiers == .Ctrl) {
                                         // TODO: self.eraseAlnumWordForwards();
                                     } else {
-                                        // TODO: self.eraseCharacterForwards();
+                                        _ = self.eraseCharacterForwards();
                                     }
                                     self.search_offset = 0;
                                     continue;
@@ -1281,7 +1425,7 @@ pub const Editor = struct {
 
     fn vtDSR(self: *Self) ![2]usize {
         _ = self;
-        return undefined;
+        return [_]usize{ 1, 1 }; // FIXME: Actually get the cursor position.
     }
 
     fn removeAtIndex(self: *Self, index: usize) void {
@@ -1289,8 +1433,26 @@ pub const Editor = struct {
         _ = index;
     }
 
-    fn reset(self: *Self) void {
-        _ = self;
+    fn reset(self: *Self) !void {
+        try self.cached_buffer_metrics.reset();
+        self.cached_prompt_valid = false;
+        self.cursor = 0;
+        self.drawn_cursor = 0;
+        self.inline_search_cursor = 0;
+        self.search_offset = 0;
+        self.search_offset_state = .Unbiased;
+        self.old_prompt_metrics = self.cached_prompt_metrics;
+        self.origin_row = 0;
+        self.origin_column = 0;
+        self.prompt_lines_at_suggestion_initiation = 0;
+        self.refresh_needed = true;
+        self.input_error = null;
+        self.returned_line = &[0]u8{};
+        self.chars_touched_in_the_middle = 0;
+        self.drawn_end_of_line_offset = 0;
+        self.drawn_spans.deinit();
+        self.drawn_spans = DrawnSpans.init(self.allocator);
+        self.paste_buffer.container.clearAndFree();
     }
 
     fn search(self: *Self, phrase: []const u8, allow_empty: bool, from_beginning: bool) bool {
@@ -1358,7 +1520,8 @@ pub const Editor = struct {
         // Do not call hook on pure cursor movements.
         if (self.cached_prompt_valid and !self.refresh_needed and self.pending_chars.container.items.len == 0) {
             try self.repositionCursor(&buffered_output, false);
-            self.cached_buffer_metrics = actualRenderedUnicodeStringMetrics(self.buffer.container.items);
+            self.cached_buffer_metrics.deinit();
+            self.cached_buffer_metrics = try self.actualRenderedUnicodeStringMetrics(self.buffer.container.items);
             self.drawn_end_of_line_offset = self.buffer.size();
             return;
         }
@@ -1373,7 +1536,8 @@ pub const Editor = struct {
                 self.pending_chars.container.clearAndFree();
                 self.drawn_cursor = self.cursor;
                 self.drawn_end_of_line_offset = self.buffer.size();
-                self.cached_buffer_metrics = actualRenderedUnicodeStringMetrics(self.buffer.container.items);
+                self.cached_buffer_metrics.deinit();
+                self.cached_buffer_metrics = try self.actualRenderedUnicodeStringMetrics(self.buffer.container.items);
                 self.drawn_spans = self.current_spans;
                 return;
             }
@@ -1395,7 +1559,8 @@ pub const Editor = struct {
             try self.vtApplyStyle(Style.resetStyle(), &buffered_output);
             self.pending_chars.container.clearAndFree();
             self.refresh_needed = false;
-            self.cached_buffer_metrics = actualRenderedUnicodeStringMetrics(self.buffer.container.items);
+            self.cached_buffer_metrics.deinit();
+            self.cached_buffer_metrics = try self.actualRenderedUnicodeStringMetrics(self.buffer.container.items);
             self.chars_touched_in_the_middle = 0;
             self.drawn_cursor = self.cursor;
             self.drawn_end_of_line_offset = self.buffer.size();
@@ -1424,7 +1589,8 @@ pub const Editor = struct {
 
         self.pending_chars.container.clearAndFree();
         self.refresh_needed = false;
-        self.cached_buffer_metrics = actualRenderedUnicodeStringMetrics(self.buffer.container.items);
+        self.cached_buffer_metrics.deinit();
+        self.cached_buffer_metrics = try self.actualRenderedUnicodeStringMetrics(self.buffer.container.items);
         self.chars_touched_in_the_middle = 0;
         self.drawn_spans = self.current_spans;
         self.drawn_end_of_line_offset = self.buffer.size();
@@ -1464,7 +1630,21 @@ pub const Editor = struct {
     }
 
     fn cleanup(self: *Self) !void {
-        _ = self;
+        const current_buffer_metrics = try self.actualRenderedUnicodeStringMetrics(self.buffer.container.items);
+        self.cached_buffer_metrics.deinit();
+        self.cached_buffer_metrics = current_buffer_metrics;
+        const new_lines = self.currentPromptMetrics().linesWithAddition(current_buffer_metrics, self.num_columns);
+        const shown_lines = self.shown_lines;
+        if (new_lines < shown_lines) {
+            self.extra_forward_lines = @max(shown_lines - new_lines, self.extra_forward_lines);
+        }
+
+        var stderr = std.io.getStdErr();
+        try self.repositionCursor(&stderr, true);
+        const current_line = self.numLines();
+        try self.vtClearLines(current_line, self.extra_forward_lines, &stderr);
+        self.extra_forward_lines = 0;
+        try self.repositionCursor(&stderr, false);
     }
 
     fn cleanupSuggestions(self: *Self) !void {
@@ -1473,8 +1653,9 @@ pub const Editor = struct {
 
     fn reallyQuitEventLoop(self: *Self) !void {
         self.finished = false;
-        var stream = std.io.getStdErr().writer();
-        try self.repositionCursor(&stream, true);
+        var stderr = std.io.getStdErr();
+        var stream = stderr.writer();
+        try self.repositionCursor(&stderr, true);
         _ = try stream.write("\n");
 
         var str = try self.getBufferedLine();
@@ -1504,18 +1685,27 @@ pub const Editor = struct {
     }
 
     fn numLines(self: *Self) usize {
-        _ = self;
-        return 0;
+        return self.currentPromptMetrics().linesWithAddition(self.cached_buffer_metrics, self.num_columns);
     }
 
-    fn cursorLine(self: *Self) usize {
-        _ = self;
-        return 0;
+    fn cursorLine(self: *Self) !usize {
+        var cursor = self.drawn_cursor;
+        if (cursor > self.cursor) {
+            cursor = self.cursor;
+        }
+        var metrics = try self.actualRenderedUnicodeStringMetrics(self.buffer.container.items[0..cursor]);
+        defer metrics.deinit();
+        return self.currentPromptMetrics().linesWithAddition(metrics, self.num_columns);
     }
 
-    fn offsetInLine(self: *Self) usize {
-        _ = self;
-        return 0;
+    fn offsetInLine(self: *Self) !usize {
+        var cursor = self.drawn_cursor;
+        if (cursor > self.cursor) {
+            cursor = self.cursor;
+        }
+        var metrics = try self.actualRenderedUnicodeStringMetrics(self.buffer.container.items[0..cursor]);
+        defer metrics.deinit();
+        return metrics.offsetWithAddition(self.currentPromptMetrics(), self.num_columns);
     }
 
     fn setOrigin(self: *Self, quit_on_error: bool) bool {
@@ -1529,9 +1719,23 @@ pub const Editor = struct {
     }
 
     fn repositionCursor(self: *Self, output_stream: anytype, to_end: bool) !void {
-        _ = self;
-        _ = output_stream;
-        _ = to_end;
+        var cursor = self.cursor;
+        var saved_cursor = cursor;
+        if (to_end) {
+            cursor = self.buffer.size();
+        }
+
+        self.cursor = cursor;
+        self.drawn_cursor = cursor;
+
+        const line = try self.cursorLine() - 1;
+        const column = try self.offsetInLine();
+
+        self.ensureFreeLinesFromOrigin(line);
+
+        try self.vtMoveAbsolute(line + self.origin_row, column + self.origin_column, output_stream);
+
+        self.cursor = saved_cursor;
     }
 
     const CodePointRange = struct {
@@ -1555,6 +1759,51 @@ pub const Editor = struct {
     }
 
     fn getTerminalSize(self: *Self) void {
-        _ = self;
+        // FIXME: Actually get the size.
+        self.num_columns = 80;
+        self.num_lines = 24;
+    }
+
+    pub fn eraseCharacterBackwards(self: *Self) bool {
+        if (self.cursor == 0) {
+            return false;
+        }
+
+        _ = self.buffer.container.orderedRemove(self.cursor - 1);
+        self.chars_touched_in_the_middle += 1;
+        self.cursor -= 1;
+        self.inline_search_cursor = self.cursor;
+        return false;
+    }
+
+    pub fn eraseCharacterForwards(self: *Self) bool {
+        if (self.cursor == self.buffer.size()) {
+            return false;
+        }
+
+        _ = self.buffer.container.orderedRemove(self.cursor);
+        self.chars_touched_in_the_middle += 1;
+        self.inline_search_cursor = self.cursor;
+        return false;
+    }
+
+    pub fn cursorLeftCharacter(self: *Self) bool {
+        if (self.cursor == 0) {
+            return false;
+        }
+
+        self.cursor -= 1;
+        self.inline_search_cursor = self.cursor;
+        return false;
+    }
+
+    pub fn cursorRightCharacter(self: *Self) bool {
+        if (self.cursor == self.buffer.size()) {
+            return false;
+        }
+
+        self.cursor += 1;
+        self.inline_search_cursor = self.cursor;
+        return false;
     }
 };
