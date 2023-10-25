@@ -164,7 +164,6 @@ pub const Style = struct {
 pub const StringMetrics = struct {
     pub const LineMetrics = struct {
         length: usize = 0,
-        visible_length: usize = 0,
 
         pub fn totalLength(self: @This()) usize {
             return self.length;
@@ -190,15 +189,18 @@ pub const StringMetrics = struct {
     pub fn linesWithAddition(self: Self, offset: Self, column_width: usize) usize {
         var lines: usize = 0;
 
-        for (self.line_metrics.container.items[0 .. self.line_metrics.size() - 1]) |line| {
-            lines += (line.totalLength() + column_width) / column_width;
+        if (self.line_metrics.size() != 0) {
+            for (0..self.line_metrics.size() - 1) |i| {
+                lines += (self.line_metrics.container.items[i].totalLength() + column_width) / column_width;
+            }
+
+            var last = self.line_metrics.container.items[self.line_metrics.size() - 1].totalLength();
+            last += offset.line_metrics.container.items[0].totalLength();
+            lines += (last + column_width) / column_width;
         }
 
-        var last = self.line_metrics.container.items[self.line_metrics.size() - 1].totalLength();
-        last += offset.line_metrics.container.items[0].totalLength();
-        lines += (last + column_width) / column_width;
-        for (offset.line_metrics.container.items[1..]) |line| {
-            lines += (line.totalLength() + column_width) / column_width;
+        for (1..offset.line_metrics.size()) |i| {
+            lines += (offset.line_metrics.container.items[i].totalLength() + column_width) / column_width;
         }
 
         return lines;
@@ -209,10 +211,17 @@ pub const StringMetrics = struct {
             return offset.line_metrics.container.items[offset.line_metrics.size() - 1].totalLength() % column_width;
         }
 
-        var last = self.line_metrics.container.items[offset.line_metrics.size() - 1].totalLength();
-        last += offset.line_metrics.container.items[0].totalLength();
+        if (self.line_metrics.size() != 0) {
+            var last = self.line_metrics.container.items[offset.line_metrics.size() - 1].totalLength();
+            last += offset.line_metrics.container.items[0].totalLength();
+            return last % column_width;
+        }
 
-        return last % column_width;
+        if (offset.line_metrics.size() == 0) {
+            return 0;
+        }
+
+        return offset.line_metrics.container.items[0].totalLength() % column_width;
     }
 
     pub fn reset(self: *Self) !void {
@@ -1590,8 +1599,11 @@ pub const Editor = struct {
     }
 
     fn removeAtIndex(self: *Self, index: usize) void {
-        _ = self;
-        _ = index;
+        const c = self.buffer.container.orderedRemove(index);
+        if (c == '\n') {
+            self.extra_forward_lines += 1;
+        }
+        self.chars_touched_in_the_middle += 1;
     }
 
     fn reset(self: *Self) !void {
@@ -1735,7 +1747,7 @@ pub const Editor = struct {
             try self.cleanup();
         }
 
-        try self.vtMoveAbsolute(self.origin_row, 0, &buffered_output);
+        try self.vtMoveAbsolute(self.origin_row, self.origin_column, &buffered_output);
 
         _ = try buffered_output.write(self.new_prompt.container.items);
 
@@ -1866,7 +1878,7 @@ pub const Editor = struct {
         }
         var metrics = try self.actualRenderedUnicodeStringMetrics(self.buffer.container.items[0..cursor]);
         defer metrics.deinit();
-        return metrics.offsetWithAddition(self.currentPromptMetrics(), self.num_columns);
+        return self.currentPromptMetrics().offsetWithAddition(metrics, self.num_columns);
     }
 
     fn setOrigin(self: *Self, quit_on_error: bool) bool {
@@ -1941,25 +1953,34 @@ pub const Editor = struct {
     }
 
     pub fn eraseCharacterBackwards(self: *Self) bool {
-        if (self.cursor == 0) {
+        if (self.is_searching) {
             return false;
         }
 
-        _ = self.buffer.container.orderedRemove(self.cursor - 1);
-        self.chars_touched_in_the_middle += 1;
+        if (self.cursor == 0) {
+            _ = std.io.getStdErr().write("\x07") catch 0; // \a BEL
+            return false;
+        }
+
+        self.removeAtIndex(self.cursor - 1);
         self.cursor -= 1;
         self.inline_search_cursor = self.cursor;
+        self.refresh_needed = true;
         return false;
     }
 
     pub fn eraseCharacterForwards(self: *Self) bool {
-        if (self.cursor == self.buffer.size()) {
+        if (self.is_searching) {
             return false;
         }
 
-        _ = self.buffer.container.orderedRemove(self.cursor);
-        self.chars_touched_in_the_middle += 1;
-        self.inline_search_cursor = self.cursor;
+        if (self.cursor == self.buffer.size()) {
+            _ = std.io.getStdErr().write("\x07") catch 0; // \a BEL
+            return false;
+        }
+
+        self.removeAtIndex(self.cursor);
+        self.refresh_needed = true;
         return false;
     }
 
