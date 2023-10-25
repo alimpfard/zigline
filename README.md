@@ -13,4 +13,10 @@ LibLine is a full-featured terminal line editor with support for:
 - and more.
 
 This port of LibLine is a work in progress, and as such, is incomplete. The following features are not yet implemented:
-- Everything except writing text and pressing enter.
+- Styling
+- Masks
+- Signal handling (resize handler + interrupt handler)
+- Autocomplete / suggestions
+- History load/save
+- History in general
+- Many more small features
