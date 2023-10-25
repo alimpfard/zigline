@@ -420,6 +420,10 @@ pub const HistoryEntry = struct {
 };
 pub const Configuration = struct {
     enable_bracketed_paste: bool = true,
+    operation_mode: enum {
+        Full,
+        NoEscapeSequences,
+    } = .Full,
 };
 
 fn vtMoveRelative(row: i64, col: i64) !void {
@@ -633,8 +637,13 @@ pub const Editor = struct {
         self.cached_prompt_metrics.deinit();
     }
 
-    pub fn reFetchDefaultTermios(self: *Self) void {
-        _ = self;
+    pub fn reFetchDefaultTermios(self: *Self) !void {
+        const t = try getTermios();
+        self.default_termios = t;
+        if (self.configuration.operation_mode == .Full) {
+            t.lflag &= ~std.os.linux.ECHO & ~std.os.linux.ICANON;
+        }
+        self.termios = t;
     }
 
     pub fn addToHistory(self: *Self, line: []const u8) void {
@@ -792,7 +801,10 @@ pub const Editor = struct {
         self.getTerminalSize();
 
         // FIXME: Windows
-        termios.lflag &= ~std.os.linux.ECHO & ~std.os.linux.ICANON;
+
+        if (self.configuration.operation_mode == .Full) {
+            termios.lflag &= ~std.os.linux.ECHO & ~std.os.linux.ICANON;
+        }
 
         try setTermios(termios);
         self.termios = termios;
@@ -1424,8 +1436,157 @@ pub const Editor = struct {
     }
 
     fn vtDSR(self: *Self) ![2]usize {
-        _ = self;
-        return [_]usize{ 1, 1 }; // FIXME: Actually get the cursor position.
+        var buf = [16]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+        var more_junk_to_read = false;
+        var stdin = std.io.getStdIn();
+        var pollfds = [1]std.os.system.pollfd{undefined};
+        {
+            var pollfd: std.os.system.pollfd = undefined;
+            pollfd.fd = stdin.handle;
+            pollfd.events = std.os.system.POLL.IN;
+            pollfd.revents = 0;
+            pollfds[0] = pollfd;
+        }
+
+        while (true) {
+            more_junk_to_read = false;
+            var rc = std.os.system.poll(&pollfds, 1, 0);
+            if (rc == 1 and pollfds[0].revents & std.os.system.POLL.IN != 0) {
+                const nread = stdin.read(&buf) catch |err| {
+                    self.finished = true;
+                    self.input_error = err;
+                    return error.ReadFailure;
+                };
+                if (nread == 0) {
+                    break;
+                }
+                try self.incomplete_data.container.appendSlice(buf[0..nread]);
+                more_junk_to_read = true;
+            }
+            if (!more_junk_to_read) {
+                break;
+            }
+        }
+
+        if (self.input_error) |err| {
+            return err;
+        }
+
+        var stderr = std.io.getStdErr();
+        _ = try stderr.write("\x1b[6n");
+
+        var state: enum {
+            Free,
+            SawEsc,
+            SawBracket,
+            InFirstCoordinate,
+            SawSemicolon,
+            InSecondCoordinate,
+            SawR,
+        } = .Free;
+        var has_error = false;
+        var coordinate_buffer = [8]u8{ 0, 0, 0, 0, 0, 0, 0, 0 };
+        var coordinate_length: usize = 0;
+        var row: usize = 0;
+        var column: usize = 0;
+
+        while (state != .SawR) {
+            var b = [1]u8{0};
+            var length = try stdin.read(&b);
+            if (length == 0) {
+                logger.debug("Got EOF while reading DSR response", .{});
+                return error.Empty;
+            }
+
+            const c = b[0];
+
+            switch (state) {
+                .Free => {
+                    if (c == 0x1b) {
+                        state = .SawEsc;
+                        continue;
+                    }
+                    try self.incomplete_data.container.append(c);
+                },
+                .SawEsc => {
+                    if (c == '[') {
+                        state = .SawBracket;
+                        continue;
+                    }
+                    try self.incomplete_data.container.append(c);
+                    state = .Free;
+                },
+                .SawBracket => {
+                    if (c >= '0' and c <= '9') {
+                        state = .InFirstCoordinate;
+                        coordinate_buffer[0] = c;
+                        coordinate_length = 1;
+                        continue;
+                    }
+                    try self.incomplete_data.container.append(c);
+                    state = .Free;
+                },
+                .InFirstCoordinate => {
+                    if (c >= '0' and c <= '9') {
+                        if (coordinate_length < coordinate_buffer.len) {
+                            coordinate_buffer[coordinate_length] = c;
+                            coordinate_length += 1;
+                        }
+                        continue;
+                    }
+                    if (c == ';') {
+                        state = .SawSemicolon;
+                        // parse the first coordinate
+                        row = std.fmt.parseInt(u8, coordinate_buffer[0..coordinate_length], 10) catch v: {
+                            has_error = true;
+                            break :v 1;
+                        };
+                        coordinate_length = 0;
+                        continue;
+                    }
+                    try self.incomplete_data.container.append(c);
+                    state = .Free;
+                },
+                .SawSemicolon => {
+                    if (c >= '0' and c <= '9') {
+                        state = .InSecondCoordinate;
+                        coordinate_buffer[0] = c;
+                        coordinate_length = 1;
+                        continue;
+                    }
+                    try self.incomplete_data.container.append(c);
+                    state = .Free;
+                },
+                .InSecondCoordinate => {
+                    if (c >= '0' and c <= '9') {
+                        if (coordinate_length < coordinate_buffer.len) {
+                            coordinate_buffer[coordinate_length] = c;
+                            coordinate_length += 1;
+                        }
+                        continue;
+                    }
+                    if (c == 'R') {
+                        // parse the second coordinate
+                        state = .SawR;
+                        column = std.fmt.parseInt(u8, coordinate_buffer[0..coordinate_length], 10) catch v: {
+                            has_error = true;
+                            break :v 1;
+                        };
+                        continue;
+                    }
+                    try self.incomplete_data.container.append(c);
+                },
+                .SawR => {
+                    unreachable;
+                },
+            }
+        }
+
+        if (has_error) {
+            logger.debug("Couldn't parse DSR response", .{});
+        }
+
+        return [2]usize{ row, column };
     }
 
     fn removeAtIndex(self: *Self, index: usize) void {
@@ -1709,9 +1870,24 @@ pub const Editor = struct {
     }
 
     fn setOrigin(self: *Self, quit_on_error: bool) bool {
-        _ = self;
-        _ = quit_on_error;
-        return undefined;
+        var position = self.vtDSR() catch |err| {
+            if (quit_on_error) {
+                self.input_error = err;
+                _ = self.finish();
+            }
+            return false;
+        };
+        self.setOriginValues(position[0], position[1]);
+        return true;
+    }
+
+    fn setOriginValues(self: *Self, row: usize, column: usize) void {
+        self.origin_row = row;
+        self.origin_column = column;
+        if (self.suggestion_display) |*display| {
+            _ = display;
+            // FIXME: display.setOriginValues(row, column);
+        }
     }
 
     fn recalculateOrigin(self: *Self) void {
