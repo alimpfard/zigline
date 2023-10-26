@@ -71,7 +71,6 @@ pub const Style = struct {
     italic: bool = false,
     background: Color = Color{ .xterm = XtermColor.Unchanged },
     foreground: Color = Color{ .xterm = XtermColor.Unchanged },
-    is_empty: bool = true,
     // FIXME: Masks + Hyperlinks
 
     const Self = @This();
@@ -93,16 +92,41 @@ pub const Style = struct {
         xterm: XtermColor,
         rgb: [3]u8,
 
-        pub fn isDefault(self: *@This()) bool {
+        pub fn isDefault(self: @This()) bool {
             return switch (self) {
                 .xterm => self.xterm == XtermColor.Unchanged,
                 .rgb => self.rgb[0] == 0 and self.rgb[1] == 0 and self.rgb[2] == 0,
             };
         }
+
+        pub fn toVTEscape(self: @This(), allocator: Allocator, role: enum { background, foreground }) ![]const u8 {
+            switch (self) {
+                .xterm => {
+                    if (self.xterm == XtermColor.Unchanged) {
+                        return "";
+                    }
+                    return try std.fmt.allocPrint(
+                        allocator,
+                        "\x1b[{d}m",
+                        .{@intFromEnum(self.xterm) + @as(u8, if (role == .background) 40 else 30)},
+                    );
+                },
+                .rgb => {
+                    return try std.fmt.allocPrint(
+                        allocator,
+                        "\x1b[{};2;{d};{d};{d}m",
+                        .{ @as(u8, if (role == .background) 48 else 38), self.rgb[0], self.rgb[1], self.rgb[2] },
+                    );
+                },
+            }
+        }
     };
 
     pub fn resetStyle() Self {
-        return .{};
+        return .{
+            .background = Color{ .xterm = XtermColor.Default },
+            .foreground = Color{ .xterm = XtermColor.Default },
+        };
     }
 
     pub fn unifiedWith(self: Self, other: Self, prefer_other: bool) Self {
@@ -121,43 +145,31 @@ pub const Style = struct {
         }
 
         if (other.bold) {
-            self.set_bold(true);
+            self.bold = true;
         }
 
         if (other.italic) {
-            self.set_italic(true);
+            self.italic = true;
         }
 
         if (other.underline) {
-            self.set_underline(true);
+            self.underline = true;
         }
-
-        self.is_empty = self.is_empty and other.is_empty;
     }
+};
+pub const Span = struct {
+    const Mode = enum {
+        ByteOriented,
+        CodePointOriented,
+    };
+    const Self = @This();
 
-    pub fn setUnderline(self: *Self, underline: bool) void {
-        self.underline = underline;
-        self.is_empty = false;
-    }
+    begin: usize,
+    end: usize,
+    mode: Mode = .CodePointOriented,
 
-    pub fn setBold(self: *Self, bold: bool) void {
-        self.bold = bold;
-        self.is_empty = false;
-    }
-
-    pub fn setItalic(self: *Self, italic: bool) void {
-        self.italic = italic;
-        self.is_empty = false;
-    }
-
-    pub fn setBackground(self: *Self, background: Color) void {
-        self.background = background;
-        self.is_empty = false;
-    }
-
-    pub fn setForeground(self: *Self, foreground: Color) void {
-        self.foreground = foreground;
-        self.is_empty = false;
+    pub fn isEmpty(self: Self) bool {
+        return self.begin >= self.end;
     }
 };
 
@@ -486,13 +498,13 @@ pub const Editor = struct {
         Title,
     };
     const DrawnSpans = struct {
-        starting: AutoHashMap(u32, std.AutoHashMap(u32, Style)),
-        ending: AutoHashMap(u32, std.AutoHashMap(u32, Style)),
+        starting: AutoHashMap(usize, AutoHashMap(usize, Style)),
+        ending: AutoHashMap(usize, AutoHashMap(usize, Style)),
 
         pub fn init(allocator: Allocator) @This() {
             return .{
-                .starting = AutoHashMap(u32, std.AutoHashMap(u32, Style)).init(allocator),
-                .ending = AutoHashMap(u32, std.AutoHashMap(u32, Style)).init(allocator),
+                .starting = AutoHashMap(usize, AutoHashMap(usize, Style)).init(allocator),
+                .ending = AutoHashMap(usize, AutoHashMap(usize, Style)).init(allocator),
             };
         }
 
@@ -507,6 +519,31 @@ pub const Editor = struct {
             _ = offset;
             return false;
         }
+
+        pub fn deepCopy(self: *const @This()) !@This() {
+            var other = @This().init(self.starting.container.allocator);
+            var start_it = self.starting.container.iterator();
+            while (start_it.next()) |start| {
+                var inner_it = start.value_ptr.container.iterator();
+                var hm = AutoHashMap(usize, Style).init(self.starting.container.allocator);
+                try other.starting.container.put(start.key_ptr.*, hm);
+                while (inner_it.next()) |inner| {
+                    try hm.container.put(inner.key_ptr.*, inner.value_ptr.*);
+                }
+            }
+
+            var end_it = self.ending.container.iterator();
+            while (end_it.next()) |end| {
+                var inner_it = end.value_ptr.container.iterator();
+                var hm = AutoHashMap(usize, Style).init(self.ending.container.allocator);
+                try other.ending.container.put(end.key_ptr.*, hm);
+                while (inner_it.next()) |inner| {
+                    try hm.container.put(inner.key_ptr.*, inner.value_ptr.*);
+                }
+            }
+
+            return other;
+        }
     };
     const LoopExitCode = enum {
         Exit,
@@ -516,6 +553,14 @@ pub const Editor = struct {
         HandleResizeEvent: bool, // reset_origin
         TryUpdateOnce: u8, // dummy
     };
+    const Callback = struct {
+        f: *const fn (*anyopaque) void,
+        context: *anyopaque,
+    };
+
+    on: struct {
+        display_refresh: ?Callback = null,
+    } = .{},
 
     allocator: Allocator,
     buffer: ArrayList(u32),
@@ -575,7 +620,6 @@ pub const Editor = struct {
     history_dirty: bool = false,
     input_state: InputState = .Free,
     previous_free_state: InputState = .Free,
-    drawn_spans: DrawnSpans,
     current_spans: DrawnSpans,
     paste_buffer: ArrayList(u32),
     initialized: bool = false,
@@ -606,7 +650,6 @@ pub const Editor = struct {
             .returned_line = &[0]u8{},
             .remembered_suggestion_static_data = ArrayList(u32).init(allocator),
             .history = ArrayList(HistoryEntry).init(allocator),
-            .drawn_spans = DrawnSpans.init(allocator),
             .current_spans = DrawnSpans.init(allocator),
             .new_prompt = ArrayList(u8).init(allocator),
             .paste_buffer = ArrayList(u32).init(allocator),
@@ -636,7 +679,6 @@ pub const Editor = struct {
         self.history.deinit();
         self.new_prompt.deinit();
         self.paste_buffer.deinit();
-        self.drawn_spans.deinit();
         self.current_spans.deinit();
         self.loop_queue.deinit();
         self.signal_queue.deinit();
@@ -669,9 +711,47 @@ pub const Editor = struct {
         _ = self;
     }
 
+    pub fn stylize(self: *Self, span: Span, style: Style) !void {
+        if (span.isEmpty()) {
+            return;
+        }
+
+        var start = span.begin;
+        var end = span.end;
+
+        if (span.mode == .ByteOriented) {
+            const offsets = self.byteOffsetRangeToCodePointOffsetRange(span.begin, span.end, 0, false);
+            start = offsets.start;
+            end = offsets.end;
+        }
+
+        var spans_starting = &self.current_spans.starting.container;
+        var spans_ending = &self.current_spans.ending.container;
+
+        var put_result = try spans_starting.getOrPut(start);
+        var starting_map = put_result.value_ptr;
+        if (!put_result.found_existing) {
+            starting_map.* = AutoHashMap(usize, Style).init(self.allocator);
+        }
+        if (!starting_map.container.contains(end)) {
+            self.refresh_needed = true;
+        }
+        try starting_map.container.put(end, style);
+
+        put_result = try spans_ending.getOrPut(end);
+        var ending_map = put_result.value_ptr;
+        if (!put_result.found_existing) {
+            ending_map.* = AutoHashMap(usize, Style).init(self.allocator);
+        }
+        if (!ending_map.container.contains(start)) {
+            self.refresh_needed = true;
+        }
+        try ending_map.container.put(start, style);
+    }
+
     pub fn stripStyles(self: *Self) void {
-        self.current_spans.ending.container.clearAndFree();
-        self.current_spans.starting.container.clearAndFree();
+        self.current_spans.deinit();
+        self.current_spans = DrawnSpans.init(self.allocator);
     }
 
     pub fn getLine(self: *Self, prompt: []const u8) ![]const u8 {
@@ -1058,10 +1138,27 @@ pub const Editor = struct {
         try self.callback_machine.registerKeyInputCallback(&[1]Key{Key{ .code_point = c }}, f);
     }
 
-    fn vtApplyStyle(self: *Self, style: Style, output_stream: anytype) !void {
+    fn vtApplyStyle(self: *Self, style: Style, output_stream: anytype, is_starting: bool) !void {
         _ = self;
-        _ = style;
-        _ = output_stream;
+
+        var buffer: [128]u8 = undefined;
+        var a = std.heap.FixedBufferAllocator.init(&buffer);
+
+        if (is_starting) {
+            var allocator = a.allocator();
+            const bg = try style.background.toVTEscape(allocator, .background);
+            defer allocator.free(bg);
+            const fg = try style.foreground.toVTEscape(allocator, .foreground);
+            defer allocator.free(fg);
+
+            try output_stream.writer().print("\x1b[{};{};{}m{s}{s}", .{
+                @as(u8, if (style.bold) 1 else 22),
+                @as(u8, if (style.underline) 4 else 24),
+                @as(u8, if (style.italic) 3 else 23),
+                bg,
+                fg,
+            });
+        }
     }
 
     fn vtMoveAbsolute(self: *Self, row: usize, col: usize, output_stream: anytype) !void {
@@ -1623,8 +1720,8 @@ pub const Editor = struct {
         self.returned_line = &[0]u8{};
         self.chars_touched_in_the_middle = 0;
         self.drawn_end_of_line_offset = 0;
-        self.drawn_spans.deinit();
-        self.drawn_spans = DrawnSpans.init(self.allocator);
+        self.current_spans.deinit();
+        self.current_spans = DrawnSpans.init(self.allocator);
         self.paste_buffer.container.clearAndFree();
     }
 
@@ -1641,9 +1738,27 @@ pub const Editor = struct {
     }
 
     fn findApplicableStyle(self: *Self, index: usize) Style {
-        _ = self;
-        _ = index;
-        return undefined;
+        var style = Style.resetStyle();
+        var it = self.current_spans.starting.container.iterator();
+        while (it.next()) |entry| {
+            unifyStylesInto(entry, index, &style);
+        }
+
+        return style;
+    }
+
+    fn unifyStylesInto(styles: std.AutoHashMap(usize, AutoHashMap(usize, Style)).Entry, offset: usize, target: *Style) void {
+        if (styles.key_ptr.* >= offset) {
+            return;
+        }
+
+        var it = styles.value_ptr.container.unmanaged.iterator();
+        while (it.next()) |entry| {
+            if (entry.key_ptr.* <= offset) {
+                return;
+            }
+            target.unifyWith(entry.value_ptr.*, true);
+        }
     }
 
     fn refreshDisplay(self: *Self) !void {
@@ -1699,7 +1814,9 @@ pub const Editor = struct {
             return;
         }
 
-        // TODO: on_display_refresh
+        if (self.on.display_refresh) |*cb| {
+            cb.f(cb.context);
+        }
 
         if (self.cached_prompt_valid) {
             if (!self.refresh_needed and self.cursor == self.buffer.size()) {
@@ -1711,36 +1828,12 @@ pub const Editor = struct {
                 self.drawn_end_of_line_offset = self.buffer.size();
                 self.cached_buffer_metrics.deinit();
                 self.cached_buffer_metrics = try self.actualRenderedUnicodeStringMetrics(self.buffer.container.items);
-                self.drawn_spans = self.current_spans;
                 return;
             }
         }
 
-        const empty_styles = AutoHashMap(u32, Style).init(self.allocator);
-
-        // If there have been no changes to previous sections of the line (style or text)
-        // just appen the new text with the appropriate styles.
-        if (!self.always_refresh and self.cached_prompt_valid and self.chars_touched_in_the_middle == 0 and self.drawn_spans.containsUpToOffset(self.current_spans, self.drawn_cursor)) {
-            const initial_style = self.findApplicableStyle(self.drawn_end_of_line_offset);
-            try self.vtApplyStyle(initial_style, &buffered_output);
-
-            for (self.drawn_end_of_line_offset..self.buffer.size()) |i| {
-                try self.applyStyles(empty_styles, &buffered_output, i);
-                try self.printCharacterAt(i, &buffered_output);
-            }
-
-            try self.vtApplyStyle(Style.resetStyle(), &buffered_output);
-            self.pending_chars.container.clearAndFree();
-            self.refresh_needed = false;
-            self.cached_buffer_metrics.deinit();
-            self.cached_buffer_metrics = try self.actualRenderedUnicodeStringMetrics(self.buffer.container.items);
-            self.chars_touched_in_the_middle = 0;
-            self.drawn_cursor = self.cursor;
-            self.drawn_end_of_line_offset = self.buffer.size();
-
-            // No need to reposition the cursor, it's already in the right place.
-            return;
-        }
+        var empty_styles = AutoHashMap(usize, Style).init(self.allocator);
+        defer empty_styles.deinit();
 
         // Ouch, reflow entire line.
         if (!has_cleaned_up) {
@@ -1754,29 +1847,83 @@ pub const Editor = struct {
         try self.vtClearToEndOfLine(&buffered_output);
 
         for (0..self.buffer.size()) |i| {
-            try self.applyStyles(empty_styles, &buffered_output, i);
+            try self.applyStyles(&empty_styles, &buffered_output, i);
             try self.printCharacterAt(i, &buffered_output);
         }
 
-        try self.vtApplyStyle(Style.resetStyle(), &buffered_output);
+        try self.vtApplyStyle(Style.resetStyle(), &buffered_output, true);
 
         self.pending_chars.container.clearAndFree();
         self.refresh_needed = false;
         self.cached_buffer_metrics.deinit();
         self.cached_buffer_metrics = try self.actualRenderedUnicodeStringMetrics(self.buffer.container.items);
         self.chars_touched_in_the_middle = 0;
-        self.drawn_spans = self.current_spans;
         self.drawn_end_of_line_offset = self.buffer.size();
         self.cached_prompt_valid = true;
 
         try self.repositionCursor(&buffered_output, false);
     }
 
-    fn applyStyles(self: *Self, empty_styles: AutoHashMap(u32, Style), output_stream: anytype, index: usize) !void {
-        _ = index;
-        _ = self;
-        _ = empty_styles;
-        _ = output_stream;
+    pub fn setHandler(self: *Self, handler: anytype) void {
+        const T = @TypeOf(handler);
+        if (@typeInfo(T) != .Pointer) {
+            @compileError("Handler must be a pointer type");
+        }
+
+        const InnerT = @TypeOf(handler.*);
+
+        inline for (@typeInfo(InnerT).Struct.decls) |decl| {
+            var h = &@field(self.on, decl.name);
+            h.* = Callback{
+                .f = &struct {
+                    pub fn theHandler(context: *anyopaque) void {
+                        var ctx: T = @alignCast(@ptrCast(context));
+                        @call(.auto, @field(InnerT, decl.name), .{ctx});
+                    }
+                }.theHandler,
+                .context = handler,
+            };
+        }
+    }
+
+    fn applyStyles(self: *Self, empty_styles: *AutoHashMap(usize, Style), output_stream: anytype, index: usize) !void {
+        const HM = AutoHashMap(usize, AutoHashMap(usize, Style));
+        var ends = (self.current_spans.ending.container.getEntry(index) orelse HM.Entry{
+            .value_ptr = empty_styles,
+            .key_ptr = undefined,
+        }).value_ptr;
+
+        var starts = (self.current_spans.starting.container.getEntry(index) orelse HM.Entry{
+            .value_ptr = empty_styles,
+            .key_ptr = undefined,
+        }).value_ptr;
+
+        if (ends.container.count() > 0) {
+            var style = Style{};
+
+            var it = ends.container.unmanaged.iterator();
+            while (it.next()) |entry| {
+                style.unifyWith(entry.value_ptr.*, false);
+            }
+
+            // Disable any style that should be turned off.
+            try self.vtApplyStyle(style, output_stream, false);
+
+            // Reapply styles for overlapping spans that include this one.
+            style = self.findApplicableStyle(index);
+            try self.vtApplyStyle(style, output_stream, true);
+        }
+
+        if (starts.container.count() > 0) {
+            var style = Style{};
+            var it = starts.container.unmanaged.iterator();
+            while (it.next()) |entry| {
+                style.unifyWith(entry.value_ptr.*, true);
+            }
+
+            // Set new styles.
+            try self.vtApplyStyle(style, output_stream, true);
+        }
     }
 
     fn printCharacterAt(self: *Self, index: usize, output_stream: anytype) !void {

@@ -6,6 +6,7 @@ fn DeinitingAutoHashMap(comptime K: type, comptime V: type, comptime deinit_key:
         container: std.AutoHashMap(K, V),
 
         const Self = @This();
+        pub const Entry = std.AutoHashMap(K, V).Entry;
 
         pub fn deinitEntries(self: *Self) void {
             var iterator = self.container.iterator();
@@ -16,7 +17,7 @@ fn DeinitingAutoHashMap(comptime K: type, comptime V: type, comptime deinit_key:
         }
 
         pub fn init(allocator: Allocator) Self {
-            return Self{
+            return .{
                 .container = std.AutoHashMap(K, V).init(allocator),
             };
         }
