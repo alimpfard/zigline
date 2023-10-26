@@ -9,16 +9,117 @@ const ArrayList = sane.ArrayList;
 const AutoHashMap = sane.AutoHashMap;
 const Queue = sane.Queue;
 
+const builtin = @import("builtin");
+const is_windows = builtin.os.tag == .windows;
+
 const logger = std.log.scoped(.zigline);
 
-// FIXME: Windows :P
-fn getTermios() !std.os.termios {
-    return try std.os.tcgetattr(std.os.STDIN_FILENO);
-}
+const SystemCapabilities = switch (builtin.os.tag) {
+    // FIXME: Windows' console handling is a mess, and std doesn't have
+    //        the necessary bindings to emulate termios on Windows.
+    //        For now, we just ignore the termios problem, which will lead to
+    //        garbled input; so we just ignore all that too and set the default
+    //        execution mode to "NonInteractive".
+    .windows, .wasi => struct {
+        const Self = @This();
 
-fn setTermios(termios: std.os.termios) !void {
-    try std.os.tcsetattr(std.os.STDIN_FILENO, std.os.linux.TCSA.NOW, termios);
-}
+        pub const termios = struct {};
+        pub const V = enum {
+            EOF,
+            EOL,
+            ERASE,
+            INTR,
+            KILL,
+            MIN,
+            QUIT,
+            START,
+            STOP,
+            SUSP,
+            TIME,
+        };
+
+        pub const default_operation_mode = Configuration.OperationMode.NonInteractive;
+
+        pub fn getTermios() !Self.termios {
+            return .{};
+        }
+
+        pub fn setTermios(_: Self.termios) !void {}
+
+        pub fn clearEchoAndICanon(_: *Self.termios) void {}
+
+        pub fn getTermiosCC(_: Self.termios, cc: Self.V) u8 {
+            return switch (cc) {
+                // Values aren't all that important, but the source is linux.
+                .EOF => 4,
+                .EOL => 0,
+                .ERASE => 127,
+                .INTR => 3,
+                .KILL => 21,
+                .MIN => 1,
+                .QUIT => 28,
+                .START => 17,
+                .STOP => 19,
+                .SUSP => 26,
+                .TIME => 0,
+            };
+        }
+
+        pub const POLL_IN = std.os.system.POLL.RDNORM;
+
+        pub fn setPollFd(p: *std.os.system.pollfd, f: *anyopaque) void {
+            p.fd = @ptrCast(f);
+        }
+
+        pub fn poll(fds: [*]std.os.system.pollfd, n: std.os.system.nfds_t, timeout: i32) c_int {
+            // std.os.system.poll() doesn't actually exist on windows lul
+            _ = timeout;
+            fds[n - 1].revents = Self.POLL_IN;
+            return 1;
+        }
+    },
+    else => struct {
+        const Self = @This();
+
+        pub const termios = std.os.termios;
+        pub const V = std.os.system.V;
+
+        pub const default_operation_mode = Configuration.OperationMode.Full;
+
+        pub fn getTermios() !Self.termios {
+            return try std.os.tcgetattr(std.os.STDIN_FILENO);
+        }
+
+        pub fn setTermios(t: Self.termios) !void {
+            try std.os.tcsetattr(std.os.STDIN_FILENO, std.os.system.TCSA.NOW, t);
+        }
+
+        pub fn clearEchoAndICanon(t: *Self.termios) void {
+            t.lflag &= ~std.os.system.ECHO & ~std.os.system.ICANON;
+        }
+
+        pub fn getTermiosCC(t: Self.termios, cc: u32) u8 {
+            return t.cc[cc];
+        }
+
+        pub const POLL_IN = std.os.system.POLL.IN;
+
+        pub fn setPollFd(p: *std.os.system.pollfd, f: std.os.fd_t) void {
+            p.fd = f;
+        }
+
+        pub fn poll(fds: [*]std.os.system.pollfd, n: std.os.system.nfds_t, timeout: i32) c_int {
+            return std.os.system.poll(fds, n, timeout);
+        }
+    },
+};
+
+const getTermiosCC = SystemCapabilities.getTermiosCC;
+const getTermios = SystemCapabilities.getTermios;
+const setTermios = SystemCapabilities.setTermios;
+const clearEchoAndICanon = SystemCapabilities.clearEchoAndICanon;
+const termios = SystemCapabilities.termios;
+const V = SystemCapabilities.V;
 
 fn isAsciiControl(code_point: u32) bool {
     return code_point < 0x20 or code_point == 0x7f;
@@ -440,11 +541,14 @@ pub const HistoryEntry = struct {
     }
 };
 pub const Configuration = struct {
-    enable_bracketed_paste: bool = true,
-    operation_mode: enum {
+    pub const OperationMode = enum {
         Full,
         NoEscapeSequences,
-    } = .Full,
+        NonInteractive,
+    };
+
+    enable_bracketed_paste: bool = true,
+    operation_mode: OperationMode = SystemCapabilities.default_operation_mode,
 };
 
 fn vtMoveRelative(row: i64, col: i64) !void {
@@ -609,8 +713,8 @@ pub const Editor = struct {
         Backward,
     } = .Forward,
     callback_machine: KeyCallbackMachine,
-    termios: std.os.termios = undefined,
-    default_termios: std.os.termios = undefined,
+    termios: termios = undefined,
+    default_termios: termios = undefined,
     was_interrupted: bool = false,
     previous_interrupt_was_handled_as_interrupt: bool = false,
     was_resized: bool = false,
@@ -692,7 +796,7 @@ pub const Editor = struct {
         const t = try getTermios();
         self.default_termios = t;
         if (self.configuration.operation_mode == .Full) {
-            t.lflag &= ~std.os.linux.ECHO & ~std.os.linux.ICANON;
+            clearEchoAndICanon(&t);
         }
         self.termios = t;
     }
@@ -755,7 +859,23 @@ pub const Editor = struct {
         self.current_spans = DrawnSpans.init(self.allocator);
     }
 
+    fn getLineNonInteractive(self: *Self, prompt: []const u8) ![]const u8 {
+        _ = try std.io.getStdErr().write(prompt);
+
+        var array = ArrayList(u8).init(self.allocator);
+        defer array.deinit();
+
+        try std.io.getStdIn().reader().streamUntilDelimiter(array.container.writer(), '\n', null);
+
+        return array.container.toOwnedSlice();
+    }
+
     pub fn getLine(self: *Self, prompt: []const u8) ![]const u8 {
+        if (self.configuration.operation_mode == .NonInteractive) {
+            // Disable all the fancy stuff, use a plain read.
+            return self.getLineNonInteractive(prompt);
+        }
+
         self.queue_cond_mutex.lock();
         defer self.queue_cond_mutex.unlock();
 
@@ -852,15 +972,15 @@ pub const Editor = struct {
     fn controlThreadMain(self: *Self) void {
         var stdin = std.io.getStdIn();
         var pollfd: std.os.system.pollfd = undefined;
-        pollfd.fd = stdin.handle;
-        pollfd.events = std.os.system.POLL.IN;
+        SystemCapabilities.setPollFd(&pollfd, stdin.handle);
+        pollfd.events = SystemCapabilities.POLL_IN;
         pollfd.revents = 0;
         var pollfds = [_]std.os.system.pollfd{pollfd};
 
         self.logic_cond_mutex.lock();
 
         while (self.is_editing) {
-            const rc = std.os.system.poll(&pollfds, 1, std.math.maxInt(i32));
+            const rc = SystemCapabilities.poll(&pollfds, 1, std.math.maxInt(i32));
             if (rc < 0) {
                 self.input_error = switch (std.os.errno(rc)) {
                     .INTR => {
@@ -878,7 +998,7 @@ pub const Editor = struct {
                 break;
             }
 
-            if (rc == 1 and pollfds[0].revents & std.os.system.POLL.IN != 0) {
+            if (rc == 1 and pollfds[0].revents & SystemCapabilities.POLL_IN != 0) {
                 self.deferred_action_queue.enqueue(DeferredAction{ .TryUpdateOnce = 0 }) catch {};
                 self.queue_condition.broadcast();
                 // Wait for the main thread to process the event, any further input between now and then will be
@@ -893,19 +1013,17 @@ pub const Editor = struct {
             return;
         }
 
-        var termios = try getTermios();
-        self.default_termios = termios;
+        var t = try getTermios();
+        self.default_termios = t;
 
         self.getTerminalSize();
 
-        // FIXME: Windows
-
         if (self.configuration.operation_mode == .Full) {
-            termios.lflag &= ~std.os.linux.ECHO & ~std.os.linux.ICANON;
+            clearEchoAndICanon(&t);
         }
 
-        try setTermios(termios);
-        self.termios = termios;
+        try setTermios(t);
+        self.termios = t;
         try self.setDefaultKeybinds();
         self.initialized = true;
     }
@@ -1503,8 +1621,7 @@ pub const Editor = struct {
             // Normally ^D. `stty eof \^n` can change it to ^N (or something else).
             // Process this here since the keybinds might override its behavior.
             // This only applies when the buffer is empty. at any other time, the behavior should be configurable.
-            // FIXME: Non-linux?
-            if (code_point == self.termios.cc[std.os.linux.V.EOF] and self.buffer.container.items.len == 0) {
+            if (code_point == getTermiosCC(self.termios, V.EOF) and self.buffer.container.items.len == 0) {
                 self.finished = true;
                 continue;
             }
@@ -1561,16 +1678,16 @@ pub const Editor = struct {
         var pollfds = [1]std.os.system.pollfd{undefined};
         {
             var pollfd: std.os.system.pollfd = undefined;
-            pollfd.fd = stdin.handle;
-            pollfd.events = std.os.system.POLL.IN;
+            SystemCapabilities.setPollFd(&pollfd, stdin.handle);
+            pollfd.events = SystemCapabilities.POLL_IN;
             pollfd.revents = 0;
             pollfds[0] = pollfd;
         }
 
         while (true) {
             more_junk_to_read = false;
-            var rc = std.os.system.poll(&pollfds, 1, 0);
-            if (rc == 1 and pollfds[0].revents & std.os.system.POLL.IN != 0) {
+            var rc = SystemCapabilities.poll(&pollfds, 1, 0);
+            if (rc == 1 and pollfds[0].revents & SystemCapabilities.POLL_IN != 0) {
                 const nread = stdin.read(&buf) catch |err| {
                     self.finished = true;
                     self.input_error = err;
