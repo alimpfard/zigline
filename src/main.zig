@@ -413,25 +413,25 @@ pub const KeyCallbackMachine = struct {
 };
 pub const HistoryEntry = struct {
     entry: ArrayList(u8),
-    timestamp: u64,
+    timestamp: i64,
 
     const Self = @This();
 
-    pub fn init(allocator: Allocator, entry: []const u8) Self {
+    pub fn init(allocator: Allocator, entry: []const u8) !Self {
         var self = Self{
             .entry = ArrayList(u8).init(allocator),
-            .timestamp = std.time.currentTime(),
+            .timestamp = std.time.timestamp(),
         };
-        self.entry.container.appendSlice(entry);
+        try self.entry.container.appendSlice(entry);
         return self;
     }
 
-    pub fn initWithTimestamp(allocator: Allocator, entry: []const u8, timestamp: u64) Self {
+    pub fn initWithTimestamp(allocator: Allocator, entry: []const u8, timestamp: i64) !Self {
         var self = Self{
             .entry = ArrayList(u8).init(allocator),
             .timestamp = timestamp,
         };
-        self.entry.container.appendSlice(entry);
+        try self.entry.container.appendSlice(entry);
         return self;
     }
 
@@ -697,8 +697,9 @@ pub const Editor = struct {
         self.termios = t;
     }
 
-    pub fn addToHistory(self: *Self, line: []const u8) void {
-        self.history.container.append(HistoryEntry.init(self.allocator, line));
+    pub fn addToHistory(self: *Self, line: []const u8) !void {
+        const entry = try HistoryEntry.init(self.allocator, line);
+        self.history.container.append(entry);
     }
 
     pub fn loadHistory(self: *Self, path: []const u8) void {
@@ -861,7 +862,15 @@ pub const Editor = struct {
         while (self.is_editing) {
             const rc = std.os.system.poll(&pollfds, 1, std.math.maxInt(i32));
             if (rc < 0) {
-                self.input_error = std.os.errno(rc);
+                self.input_error = switch (std.os.errno(rc)) {
+                    .INTR => {
+                        continue;
+                    },
+                    .NOMEM => error.SystemResource,
+                    else => {
+                        unreachable;
+                    },
+                };
                 self.loop_queue.enqueue(.Exit) catch {
                     break;
                 };
