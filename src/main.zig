@@ -1124,6 +1124,10 @@ pub const Editor = struct {
         try self.registerCharInputCallback(ctrl('H'), &Self.eraseCharacterBackwards);
         // DEL, some terminals send this instead of ctrl('H')
         try self.registerCharInputCallback(127, &Self.eraseCharacterBackwards);
+        try self.registerCharInputCallback(ctrl('D'), &Self.eraseCharacterForwards);
+        try self.registerCharInputCallback(ctrl('A'), &Self.goHome);
+        try self.registerCharInputCallback(ctrl('E'), &Self.goEnd);
+        try self.registerCharInputCallback(ctrl('L'), &Self.clearScreen);
     }
 
     fn registerKeyInputCallback(self: *Self, key: Key, c: *const fn (*Editor) bool) !void {
@@ -2097,6 +2101,31 @@ pub const Editor = struct {
         // FIXME: Actually get the size.
         self.num_columns = 80;
         self.num_lines = 24;
+    }
+
+    pub fn goEnd(self: *Self) bool {
+        self.cursor = self.buffer.size();
+        self.inline_search_cursor = self.cursor;
+        self.search_offset = 0;
+        return false;
+    }
+
+    pub fn goHome(self: *Self) bool {
+        self.cursor = 0;
+        self.inline_search_cursor = self.cursor;
+        self.search_offset = 0;
+        return false;
+    }
+
+    pub fn clearScreen(self: *Self) bool {
+        var stderr = std.io.getStdErr();
+        _ = stderr.write("\x1b[3J\x1b[H\x1b[2J") catch 0;
+
+        self.vtMoveAbsolute(1, 1, &stderr) catch {};
+        self.setOriginValues(1, 1);
+        self.refresh_needed = true;
+        self.cached_prompt_valid = false;
+        return false;
     }
 
     pub fn eraseCharacterBackwards(self: *Self) bool {
