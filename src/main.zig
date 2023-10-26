@@ -807,7 +807,7 @@ pub const Editor = struct {
 
     pub fn addToHistory(self: *Self, line: []const u8) !void {
         const entry = try HistoryEntry.init(self.allocator, line);
-        self.history.container.append(entry);
+        try self.history.container.append(entry);
     }
 
     pub fn loadHistory(self: *Self, path: []const u8) void {
