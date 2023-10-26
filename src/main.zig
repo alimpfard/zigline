@@ -82,7 +82,11 @@ const SystemCapabilities = switch (builtin.os.tag) {
         const Self = @This();
 
         pub const termios = std.os.termios;
-        pub const V = std.os.system.V;
+
+        // FIXME: Non-linux systems...?
+        pub const V = std.os.linux.V;
+        const ECHO = std.os.linux.ECHO;
+        const ICANON = std.os.linux.ICANON;
 
         pub const default_operation_mode = Configuration.OperationMode.Full;
 
@@ -95,7 +99,7 @@ const SystemCapabilities = switch (builtin.os.tag) {
         }
 
         pub fn clearEchoAndICanon(t: *Self.termios) void {
-            t.lflag &= ~std.os.system.ECHO & ~std.os.system.ICANON;
+            t.lflag &= ~ECHO & ~ICANON;
         }
 
         pub fn getTermiosCC(t: Self.termios, cc: u32) u8 {
