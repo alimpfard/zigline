@@ -16,6 +16,4 @@ This port of LibLine is a work in progress, and as such, is incomplete. The foll
 - Masks
 - Signal handling (resize handler + interrupt handler)
 - Autocomplete / suggestions
-- History load/save
-- History in general
 - Many more small features

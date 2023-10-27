@@ -113,3 +113,64 @@ pub fn Queue(comptime T: type) type {
         }
     };
 }
+
+fn Checkpoint(comptime T: type) type {
+    return struct {
+        v: T,
+        p: *T,
+        pub fn restore(self: @This()) void {
+            self.p.* = self.v;
+        }
+    };
+}
+
+fn checkpointImpl(comptime T: type, value: *T) Checkpoint(T) {
+    return .{
+        .v = value.*,
+        .p = value,
+    };
+}
+
+pub fn checkpoint(value: anytype) Checkpoint(@TypeOf(value.*)) {
+    return checkpointImpl(@TypeOf(value.*), value);
+}
+
+pub const StringBuilder = struct {
+    buffer: ArrayList(u8),
+
+    const Self = @This();
+
+    pub fn init(allocator: Allocator) Self {
+        return .{
+            .buffer = ArrayList(u8).init(allocator),
+        };
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.buffer.deinit();
+    }
+
+    pub fn appendCodePoint(self: *Self, c: u32) !void {
+        var buf: [4]u8 = [_]u8{0} ** 4;
+        const length = try std.unicode.utf8Encode(@intCast(c), &buf);
+        try self.buffer.container.appendSlice(buf[0..length]);
+    }
+
+    pub fn appendSlice(self: *Self, slice: []const u8) !void {
+        try self.buffer.container.appendSlice(slice);
+    }
+
+    pub fn appendUtf32Slice(self: *Self, slice: []const u32) !void {
+        for (slice) |c| {
+            try self.appendCodePoint(c);
+        }
+    }
+
+    pub fn toOwnedSlice(self: *Self) ![]u8 {
+        return self.buffer.container.toOwnedSlice();
+    }
+
+    pub fn toSlice(self: *Self) []u8 {
+        return self.buffer.container.items;
+    }
+};

@@ -6,6 +6,10 @@ pub fn main() !void {
     defer _ = gpa.deinit();
 
     var editor = Editor.init(gpa.allocator(), .{});
+    defer editor.deinit();
+
+    try editor.loadHistory("test.hist");
+    defer editor.saveHistory("test.hist") catch unreachable;
 
     var handler: struct {
         editor: *Editor,
@@ -33,7 +37,8 @@ pub fn main() !void {
 
     const line: []const u8 = try editor.getLine("> ");
     defer gpa.allocator().free(line);
-    defer editor.deinit();
+
+    try editor.addToHistory(line);
 
     std.log.info("line: {s}\n", .{line});
 }

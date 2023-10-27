@@ -810,14 +810,42 @@ pub const Editor = struct {
         try self.history.container.append(entry);
     }
 
-    pub fn loadHistory(self: *Self, path: []const u8) void {
-        _ = path;
-        _ = self;
+    pub fn loadHistory(self: *Self, path: []const u8) !void {
+        var history_file = std.fs.cwd().openFile(path, .{}) catch |err| switch (err) {
+            error.FileNotFound => {
+                return;
+            },
+            else => {
+                return err;
+            },
+        };
+        defer history_file.close();
+        const data = try history_file.reader().readAllAlloc(self.allocator, std.math.maxInt(usize));
+        defer self.allocator.free(data);
+        var it = std.mem.splitSequence(u8, data, "\n\n");
+        while (it.next()) |str| {
+            if (str.len == 0 or (str.len == 1 and str[0] == '\n')) {
+                continue;
+            }
+
+            const entry_start = std.mem.indexOf(u8, str, "::") orelse 0;
+            const timestamp = std.fmt.parseInt(i64, str[0..entry_start], 10) catch 0;
+            const entry = try HistoryEntry.initWithTimestamp(
+                self.allocator,
+                str[(if (entry_start == 0) 0 else entry_start + 2)..],
+                timestamp,
+            );
+            try self.history.container.append(entry);
+        }
     }
 
-    pub fn saveHistory(self: *Self, path: []const u8) void {
-        _ = path;
-        _ = self;
+    pub fn saveHistory(self: *Self, path: []const u8) !void {
+        var history_file = try std.fs.cwd().createFile(path, .{});
+        defer history_file.close();
+        var writer = history_file.writer();
+        for (self.history.container.items) |entry| {
+            try writer.print("{}::{s}\n\n", .{ entry.timestamp, entry.entry.container.items });
+        }
     }
 
     pub fn stylize(self: *Self, span: Span, style: Style) !void {
@@ -1503,11 +1531,11 @@ pub const Editor = struct {
 
                         switch (csi_final) {
                             'A' => { // ^[[A: arrow up
-                                // TODO: self.searchBackwards();
+                                _ = self.searchBackwards();
                                 continue;
                             },
                             'B' => { // ^[[B: arrow down
-                                // TODO: self.searchForwards();
+                                _ = self.searchForwards();
                                 continue;
                             },
                             'D' => { // ^[[D: arrow left
@@ -1860,15 +1888,64 @@ pub const Editor = struct {
     }
 
     fn search(self: *Self, phrase: []const u8, allow_empty: bool, from_beginning: bool) bool {
-        _ = self;
-        _ = phrase;
-        _ = allow_empty;
-        _ = from_beginning;
-        return undefined;
+        var last_matching_offset: i32 = -1;
+        var found: bool = false;
+
+        if (allow_empty or phrase.len > 0) {
+            var search_offset = self.search_offset;
+            var i = self.history_cursor;
+            while (i > 0) : (i -= 1) {
+                const entry = self.history.container.items[i - 1];
+                // Dear zig fmt, please understand that sometimes you have to break lines.
+                const contains = if (from_beginning) r: {
+                    break :r std.mem.startsWith(u8, entry.entry.container.items, phrase);
+                } else r: {
+                    break :r std.mem.containsAtLeast(u8, entry.entry.container.items, 1, phrase);
+                };
+                if (contains) {
+                    last_matching_offset = @as(i32, @intCast(i)) - 1;
+                    if (search_offset == 0) {
+                        found = true;
+                        break;
+                    }
+                    if (self.search_offset > 0) {
+                        self.search_offset -= 1;
+                    }
+                }
+            }
+
+            if (!found) {
+                _ = std.io.getStdErr().write("\x07") catch 0;
+            }
+        }
+
+        if (found) {
+            // We're gonna clear the buffer, so mark the entire thing touched.
+            self.chars_touched_in_the_middle = self.buffer.container.items.len;
+            self.buffer.container.clearRetainingCapacity();
+            self.cursor = 0;
+            self.insertString(self.history.container.items[@intCast(last_matching_offset)].entry.container.items);
+            // Always needed.
+            self.refresh_needed = true;
+        }
+
+        return found;
     }
 
     fn endSearch(self: *Self) void {
-        _ = self;
+        self.is_searching = false;
+        self.refresh_needed = true;
+        self.search_offset = 0;
+        if (self.reset_buffer_on_search_end) {
+            self.buffer.container.clearRetainingCapacity();
+            self.insertUtf32(self.pre_search_buffer.container.items);
+            self.cursor = self.pre_search_cursor;
+        }
+        self.reset_buffer_on_search_end = true;
+        if (self.search_editor) |e| {
+            e.deinit();
+        }
+        self.search_editor = null;
     }
 
     fn findApplicableStyle(self: *Self, index: usize) Style {
@@ -2307,6 +2384,72 @@ pub const Editor = struct {
 
         self.cursor += 1;
         self.inline_search_cursor = self.cursor;
+        return false;
+    }
+
+    pub fn searchForwards(self: *Self) bool {
+        const p = sane.checkpoint(&self.inline_search_cursor);
+        defer p.restore();
+
+        var builder = sane.StringBuilder.init(self.allocator);
+        defer builder.deinit();
+
+        builder.appendUtf32Slice(self.buffer.container.items[0..self.inline_search_cursor]) catch return false;
+        const search_phrase = builder.toSlice();
+
+        if (self.search_offset_state == .Backwards) {
+            if (self.search_offset > 0) {
+                self.search_offset -= 1;
+            }
+        }
+
+        if (self.search_offset > 0) {
+            var p1 = sane.checkpoint(&self.search_offset);
+            defer p1.restore();
+
+            self.search_offset -= 1;
+            if (self.search(search_phrase, true, true)) {
+                self.search_offset_state = .Forwards;
+                p1.v = self.search_offset;
+            } else {
+                self.search_offset_state = .Unbiased;
+            }
+        } else {
+            self.search_offset_state = .Unbiased;
+            self.chars_touched_in_the_middle = self.buffer.size();
+            self.cursor = 0;
+            self.buffer.container.clearRetainingCapacity();
+            self.insertString(search_phrase);
+            self.refresh_needed = true;
+        }
+
+        return false;
+    }
+
+    pub fn searchBackwards(self: *Self) bool {
+        const p = sane.checkpoint(&self.inline_search_cursor);
+        defer p.restore();
+
+        var builder = sane.StringBuilder.init(self.allocator);
+        defer builder.deinit();
+
+        builder.appendUtf32Slice(self.buffer.container.items[0..self.inline_search_cursor]) catch return false;
+        const search_phrase = builder.toSlice();
+
+        if (self.search_offset_state == .Forwards) {
+            self.search_offset += 1;
+        }
+
+        if (self.search(search_phrase, true, true)) {
+            self.search_offset_state = .Backwards;
+            self.search_offset += 1;
+        } else {
+            self.search_offset_state = .Unbiased;
+            if (self.search_offset > 0) {
+                self.search_offset -= 1;
+            }
+        }
+
         return false;
     }
 };
