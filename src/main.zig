@@ -71,7 +71,7 @@ const SystemCapabilities = switch (builtin.os.tag) {
             p.fd = @ptrCast(f);
         }
 
-        pub fn poll(fds: [*]std.os.system.pollfd, n: std.os.system.nfds_t, timeout: i32) c_int {
+        pub fn poll(fds: [*]std.os.system.pollfd, n: std.os.system.nfds_t, timeout: i32) usize {
             // std.os.system.poll() doesn't actually exist on windows lul
             _ = timeout;
             fds[n - 1].revents = Self.POLL_IN;
@@ -112,7 +112,7 @@ const SystemCapabilities = switch (builtin.os.tag) {
             p.fd = f;
         }
 
-        pub fn poll(fds: [*]std.os.system.pollfd, n: std.os.system.nfds_t, timeout: i32) c_int {
+        pub fn poll(fds: [*]std.os.system.pollfd, n: std.os.system.nfds_t, timeout: i32) usize {
             return std.os.system.poll(fds, n, timeout);
         }
     },
