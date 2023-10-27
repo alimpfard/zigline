@@ -112,8 +112,9 @@ const SystemCapabilities = switch (builtin.os.tag) {
             p.fd = f;
         }
 
-        pub fn poll(fds: [*]std.os.system.pollfd, n: std.os.system.nfds_t, timeout: i32) c_int {
-            return @intCast(std.os.system.poll(fds, n, timeout));
+        const PollReturnType = if (builtin.link_libc) c_int else usize; // AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+        pub fn poll(fds: [*]std.os.system.pollfd, n: std.os.system.nfds_t, timeout: i32) PollReturnType {
+            return std.os.system.poll(fds, n, timeout);
         }
     },
 };
@@ -1052,7 +1053,7 @@ pub const Editor = struct {
         while (self.is_editing) {
             const rc = SystemCapabilities.poll(&pollfds, 2, std.math.maxInt(i32));
             if (rc < 0) {
-                self.input_error = switch (std.os.errno(@bitCast(@as(i64, rc)))) {
+                self.input_error = switch (std.os.errno(rc)) {
                     .INTR => {
                         continue;
                     },
