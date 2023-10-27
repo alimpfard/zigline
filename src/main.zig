@@ -738,6 +738,11 @@ pub const Editor = struct {
     have_unprocessed_read_event: bool = false,
     configuration: Configuration,
     control_thread: ?Thread = null,
+    control_thread_exited: bool = false,
+    thread_kill_pipe: ?struct {
+        write: std.os.fd_t,
+        read: std.os.fd_t,
+    } = null,
 
     queue_cond_mutex: Mutex = .{},
     queue_condition: Condition = .{},
@@ -775,8 +780,8 @@ pub const Editor = struct {
 
     pub fn deinit(self: *Self) void {
         if (self.control_thread) |t| {
-            // FIXME: This is a hack, the thread should be cancelled.
-            t.detach();
+            self.nicelyAskControlThreadToDie() catch {};
+            t.join();
         }
 
         self.buffer.deinit();
@@ -902,6 +907,18 @@ pub const Editor = struct {
         return array.container.toOwnedSlice();
     }
 
+    fn nicelyAskControlThreadToDie(self: *Self) !void {
+        if (self.control_thread_exited) {
+            return;
+        }
+
+        // In the absence of way to interrupt threads, we're just gonna write to it and hope it dies on its own pace.
+        if (self.thread_kill_pipe) |pipes| {
+            _ = std.os.write(pipes.write, "x") catch 0;
+        }
+        self.logic_condition.broadcast();
+    }
+
     pub fn getLine(self: *Self, prompt: []const u8) ![]const u8 {
         if (self.configuration.operation_mode == .NonInteractive) {
             // Disable all the fancy stuff, use a plain read.
@@ -910,6 +927,14 @@ pub const Editor = struct {
 
         self.queue_cond_mutex.lock();
         defer self.queue_cond_mutex.unlock();
+
+        if (self.thread_kill_pipe == null) {
+            const pipe = try std.os.pipe();
+            self.thread_kill_pipe = .{
+                .read = pipe[0],
+                .write = pipe[1],
+            };
+        }
 
         start: while (true) {
             try self.initialize();
@@ -945,6 +970,12 @@ pub const Editor = struct {
 
             try self.refreshDisplay();
 
+            if (self.control_thread) |t| {
+                try self.nicelyAskControlThreadToDie();
+                t.join();
+            }
+
+            self.control_thread_exited = false;
             self.control_thread = try Thread.spawn(.{}, Self.controlThreadMain, .{self});
 
             if (self.incomplete_data.container.items.len != 0) {
@@ -1002,19 +1033,26 @@ pub const Editor = struct {
     }
 
     fn controlThreadMain(self: *Self) void {
+        defer self.control_thread_exited = true;
+
         var stdin = std.io.getStdIn();
-        var pollfd: std.os.system.pollfd = undefined;
-        SystemCapabilities.setPollFd(&pollfd, stdin.handle);
-        pollfd.events = SystemCapabilities.POLL_IN;
-        pollfd.revents = 0;
-        var pollfds = [_]std.os.system.pollfd{pollfd};
+
+        std.debug.assert(self.thread_kill_pipe != null);
+
+        var pollfds = [_]std.os.system.pollfd{ undefined, undefined };
+        SystemCapabilities.setPollFd(&pollfds[0], stdin.handle);
+        SystemCapabilities.setPollFd(&pollfds[1], self.thread_kill_pipe.?.read);
+        pollfds[0].events = SystemCapabilities.POLL_IN;
+        pollfds[1].events = SystemCapabilities.POLL_IN;
 
         self.logic_cond_mutex.lock();
+        defer self.logic_cond_mutex.unlock();
+        defer self.queue_condition.broadcast();
 
         while (self.is_editing) {
-            const rc = SystemCapabilities.poll(&pollfds, 1, std.math.maxInt(i32));
+            const rc = SystemCapabilities.poll(&pollfds, 2, std.math.maxInt(i32));
             if (rc < 0) {
-                self.input_error = switch (std.os.errno(rc)) {
+                self.input_error = switch (std.os.errno(@bitCast(@as(i64, rc)))) {
                     .INTR => {
                         continue;
                     },
@@ -1030,7 +1068,18 @@ pub const Editor = struct {
                 break;
             }
 
-            if (rc == 1 and pollfds[0].revents & SystemCapabilities.POLL_IN != 0) {
+            if (pollfds[1].revents & SystemCapabilities.POLL_IN != 0) {
+                // We're supposed to die...after draining the pipe.
+                var buf = [_]u8{0} ** 8;
+                _ = std.os.read(self.thread_kill_pipe.?.read, &buf) catch 0;
+                break;
+            }
+
+            if (pollfds[0].revents & SystemCapabilities.POLL_IN != 0) {
+                if (!self.is_editing) {
+                    break;
+                }
+
                 self.deferred_action_queue.enqueue(DeferredAction{ .TryUpdateOnce = 0 }) catch {};
                 self.queue_condition.broadcast();
                 // Wait for the main thread to process the event, any further input between now and then will be
@@ -1654,7 +1703,7 @@ pub const Editor = struct {
             // Process this here since the keybinds might override its behavior.
             // This only applies when the buffer is empty. at any other time, the behavior should be configurable.
             if (code_point == getTermiosCC(self.termios, V.EOF) and self.buffer.container.items.len == 0) {
-                self.finished = true;
+                _ = self.finishEdit();
                 continue;
             }
 
@@ -2450,6 +2499,16 @@ pub const Editor = struct {
             }
         }
 
+        return false;
+    }
+
+    pub fn finishEdit(self: *Self) bool {
+        _ = std.io.getStdErr().write("<EOF>\n") catch 0;
+        if (!self.always_refresh) {
+            self.input_error = error.Eof;
+            _ = self.finish();
+            self.reallyQuitEventLoop() catch {};
+        }
         return false;
     }
 };

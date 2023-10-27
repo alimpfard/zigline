@@ -35,10 +35,18 @@ pub fn main() !void {
     } = .{ .editor = &editor };
     editor.setHandler(&handler);
 
-    const line: []const u8 = try editor.getLine("> ");
-    defer gpa.allocator().free(line);
+    while (true) {
+        const line: []const u8 = editor.getLine("> ") catch |err| switch (err) {
+            error.Eof => break,
+            else => return err,
+        };
+        defer gpa.allocator().free(line);
 
-    try editor.addToHistory(line);
+        try editor.addToHistory(line);
+        std.log.info("line: {s}\n", .{line});
 
-    std.log.info("line: {s}\n", .{line});
+        if (std.mem.eql(u8, line, "quit")) {
+            break;
+        }
+    }
 }
