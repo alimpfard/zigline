@@ -11,9 +11,11 @@ const Queue = sane.Queue;
 
 const builtin = @import("builtin");
 const is_windows = builtin.os.tag == .windows;
+const should_enable_signal_handling = !is_windows and builtin.os.tag != .wasi;
 
 const logger = std.log.scoped(.zigline);
 
+// std.os is a LIE!
 const SystemCapabilities = switch (builtin.os.tag) {
     // FIXME: Windows' console handling is a mess, and std doesn't have
     //        the necessary bindings to emulate termios on Windows.
@@ -22,6 +24,7 @@ const SystemCapabilities = switch (builtin.os.tag) {
     //        execution mode to "NonInteractive".
     .windows, .wasi => struct {
         const Self = @This();
+        pub const Sigaction = struct {}; // This is not implemented in Zig, and we're not about to try.
 
         pub const termios = struct {};
         pub const V = enum {
@@ -77,9 +80,25 @@ const SystemCapabilities = switch (builtin.os.tag) {
             fds[n - 1].revents = Self.POLL_IN;
             return 1;
         }
+
+        const pipe = (if (is_windows) struct {
+            pub fn pipe() anyerror![2]std.os.fd_t {
+                var rd: std.os.windows.HANDLE = undefined;
+                var wr: std.os.windows.HANDLE = undefined;
+                var attrs: std.os.windows.SECURITY_ATTRIBUTES = undefined;
+                attrs.nLength = 0;
+                try std.os.windows.CreatePipe(&rd, &wr, &attrs);
+                return [2]std.os.fd_t{ @ptrCast(rd), @ptrCast(wr) };
+            }
+        } else struct {
+            pub fn pipe() anyerror![2]std.os.fd_t {
+                return std.os.pipe();
+            }
+        }).pipe;
     },
     else => struct {
         const Self = @This();
+        pub const Sigaction = std.os.Sigaction;
 
         pub const termios = std.os.termios;
 
@@ -116,6 +135,8 @@ const SystemCapabilities = switch (builtin.os.tag) {
         pub fn poll(fds: [*]std.os.system.pollfd, n: std.os.system.nfds_t, timeout: i32) PollReturnType {
             return std.os.system.poll(fds, n, timeout);
         }
+
+        pub const pipe = std.os.pipe;
     },
 };
 
@@ -554,7 +575,7 @@ pub const Configuration = struct {
 
     enable_bracketed_paste: bool = true,
     operation_mode: OperationMode = SystemCapabilities.default_operation_mode,
-    enable_signal_handling: bool = true,
+    enable_signal_handling: bool = should_enable_signal_handling,
 };
 
 fn vtMoveRelative(row: i64, col: i64) !void {
@@ -589,8 +610,8 @@ var signalHandlingData: ?struct {
         write: std.os.fd_t,
         read: std.os.fd_t,
     },
-    old_sigint: ?std.os.Sigaction = null,
-    old_sigwinch: ?std.os.Sigaction = null,
+    old_sigint: ?SystemCapabilities.Sigaction = null,
+    old_sigwinch: ?SystemCapabilities.Sigaction = null,
 
     pub fn handleSignal(signo: i32) callconv(.C) void {
         var f = std.fs.File{
@@ -975,35 +996,37 @@ pub const Editor = struct {
         defer self.queue_cond_mutex.unlock();
 
         if (self.thread_kill_pipe == null) {
-            const pipe = try std.os.pipe();
+            const pipe = try SystemCapabilities.pipe();
             self.thread_kill_pipe = .{
                 .read = pipe[0],
                 .write = pipe[1],
             };
         }
 
-        if (self.configuration.enable_signal_handling) {
-            if (signalHandlingData == null) {
-                const pipe = try std.os.pipe();
-                signalHandlingData = .{
-                    .pipe = .{
-                        .read = pipe[0],
-                        .write = pipe[1],
-                    },
-                };
+        if (should_enable_signal_handling) {
+            if (self.configuration.enable_signal_handling) {
+                if (signalHandlingData == null) {
+                    const pipe = try SystemCapabilities.pipe();
+                    signalHandlingData = .{
+                        .pipe = .{
+                            .read = pipe[0],
+                            .write = pipe[1],
+                        },
+                    };
 
-                signalHandlingData.?.old_sigint = @as(std.os.Sigaction, undefined);
-                signalHandlingData.?.old_sigwinch = @as(std.os.Sigaction, undefined);
-                try std.os.sigaction(
-                    std.os.SIG.INT,
-                    &std.os.Sigaction{ .handler = .{ .handler = @TypeOf(signalHandlingData.?).handleSignal }, .mask = std.os.empty_sigset, .flags = 0 },
-                    &signalHandlingData.?.old_sigint.?,
-                );
-                try std.os.sigaction(
-                    std.os.SIG.WINCH,
-                    &std.os.Sigaction{ .handler = .{ .handler = @TypeOf(signalHandlingData.?).handleSignal }, .mask = std.os.empty_sigset, .flags = 0 },
-                    &signalHandlingData.?.old_sigwinch.?,
-                );
+                    signalHandlingData.?.old_sigint = @as(SystemCapabilities.Sigaction, undefined);
+                    signalHandlingData.?.old_sigwinch = @as(SystemCapabilities.Sigaction, undefined);
+                    try std.os.sigaction(
+                        std.os.SIG.INT,
+                        &SystemCapabilities.Sigaction{ .handler = .{ .handler = @TypeOf(signalHandlingData.?).handleSignal }, .mask = std.os.empty_sigset, .flags = 0 },
+                        &signalHandlingData.?.old_sigint.?,
+                    );
+                    try std.os.sigaction(
+                        std.os.SIG.WINCH,
+                        &SystemCapabilities.Sigaction{ .handler = .{ .handler = @TypeOf(signalHandlingData.?).handleSignal }, .mask = std.os.empty_sigset, .flags = 0 },
+                        &signalHandlingData.?.old_sigwinch.?,
+                    );
+                }
             }
         }
 
@@ -1160,37 +1183,39 @@ pub const Editor = struct {
                 break;
             }
 
-            if (pollfds[2].revents & SystemCapabilities.POLL_IN != 0) no_read: {
-                // A signal! Let's handle it.
-                var f = std.fs.File{
-                    .handle = signalHandlingData.?.pipe.read,
-                    .capable_io_mode = .blocking,
-                    .intended_io_mode = .blocking,
-                };
-                const signo = f.reader().readInt(i32, .Little) catch {
-                    break :no_read;
-                };
-                switch (signo) {
-                    std.os.SIG.INT => {
-                        self.signal_queue.enqueue(.SIGINT) catch {
-                            break :no_read;
-                        };
-                    },
-                    std.os.SIG.WINCH => {
-                        self.signal_queue.enqueue(.SIGWINCH) catch {
-                            break :no_read;
-                        };
-                    },
-                    else => {
+            if (!is_windows) {
+                if (pollfds[2].revents & SystemCapabilities.POLL_IN != 0) no_read: {
+                    // A signal! Let's handle it.
+                    var f = std.fs.File{
+                        .handle = signalHandlingData.?.pipe.read,
+                        .capable_io_mode = .blocking,
+                        .intended_io_mode = .blocking,
+                    };
+                    const signo = f.reader().readInt(i32, .Little) catch {
                         break :no_read;
-                    },
+                    };
+                    switch (signo) {
+                        std.os.SIG.INT => {
+                            self.signal_queue.enqueue(.SIGINT) catch {
+                                break :no_read;
+                            };
+                        },
+                        std.os.SIG.WINCH => {
+                            self.signal_queue.enqueue(.SIGWINCH) catch {
+                                break :no_read;
+                            };
+                        },
+                        else => {
+                            break :no_read;
+                        },
+                    }
+                    self.queue_condition.broadcast();
+                    // Wait for the main thread to process the event, any further input between now and then will be
+                    // picked up either immediately, or in the next cycle.
+                    self.logic_cond_mutex.lock();
+                    defer self.logic_cond_mutex.unlock();
+                    self.logic_condition.wait(&self.logic_cond_mutex);
                 }
-                self.queue_condition.broadcast();
-                // Wait for the main thread to process the event, any further input between now and then will be
-                // picked up either immediately, or in the next cycle.
-                self.logic_cond_mutex.lock();
-                defer self.logic_cond_mutex.unlock();
-                self.logic_condition.wait(&self.logic_cond_mutex);
             }
 
             if (pollfds[0].revents & SystemCapabilities.POLL_IN != 0) {
@@ -2558,11 +2583,12 @@ pub const Editor = struct {
         self.num_columns = 80;
         self.num_lines = 24;
         if (!is_windows) {
-            var ws: std.os.system.winsize = undefined;
-            if (std.os.system.ioctl(std.io.getStdIn().handle, std.os.system.T.IOCGWINSZ, @intFromPtr(&ws)) != 0) {
-                var fd = std.os.system.open("/dev/tty", std.os.system.O.RDONLY, 0);
+            const system = if (builtin.link_libc and builtin.os.tag == .linux) std.os.linux else std.os.system;
+            var ws: system.winsize = undefined;
+            if (std.os.system.ioctl(std.io.getStdIn().handle, system.T.IOCGWINSZ, @intFromPtr(&ws)) != 0) {
+                var fd = std.os.system.open("/dev/tty", std.os.system.O.RDONLY, @as(std.os.mode_t, 0));
                 if (fd != -1) {
-                    _ = std.os.system.ioctl(@intCast(fd), std.os.system.T.IOCGWINSZ, @intFromPtr(&ws));
+                    _ = std.os.system.ioctl(@intCast(fd), system.T.IOCGWINSZ, @intFromPtr(&ws));
                     _ = std.os.system.close(@intCast(fd));
                 } else {
                     return;
