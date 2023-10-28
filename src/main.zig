@@ -1544,18 +1544,18 @@ pub const Editor = struct {
                                 try csi_parameters.append(0);
                             }
                         }
-                        var param0: u32 = 0;
                         var param1: u32 = 0;
+                        var param2: u32 = 0;
                         if (csi_parameters.items.len >= 1) {
-                            param0 = csi_parameters.items[0];
+                            param1 = csi_parameters.items[0];
                         }
                         if (csi_parameters.items.len >= 2) {
-                            param1 = csi_parameters.items[1];
+                            param2 = csi_parameters.items[1];
                         }
 
                         var modifiers: CSIMod = .None;
-                        if (param1 != 0) {
-                            modifiers = @enumFromInt(@as(u8, @intCast(param1 - 1)));
+                        if (param2 != 0) {
+                            modifiers = @enumFromInt(@as(u8, @intCast(param2 - 1)));
                         }
 
                         if (is_in_paste and code_point != '~' and param1 != 201) {
