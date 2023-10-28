@@ -782,6 +782,7 @@ pub const Editor = struct {
     pub fn deinit(self: *Self) void {
         if (self.control_thread) |t| {
             self.nicelyAskControlThreadToDie() catch {};
+            self.logic_condition.broadcast();
             t.join();
         }
 
@@ -917,7 +918,6 @@ pub const Editor = struct {
         if (self.thread_kill_pipe) |pipes| {
             _ = std.os.write(pipes.write, "x") catch 0;
         }
-        self.logic_condition.broadcast();
     }
 
     pub fn getLine(self: *Self, prompt: []const u8) ![]const u8 {
@@ -973,6 +973,7 @@ pub const Editor = struct {
 
             if (self.control_thread) |t| {
                 try self.nicelyAskControlThreadToDie();
+                self.logic_condition.broadcast();
                 t.join();
             }
 
@@ -988,6 +989,9 @@ pub const Editor = struct {
 
             while (true) {
                 self.queue_condition.wait(&self.queue_cond_mutex);
+                self.logic_cond_mutex.lock();
+                defer self.logic_cond_mutex.unlock();
+                defer self.logic_condition.broadcast();
 
                 while (!self.signal_queue.isEmpty()) {
                     switch (self.signal_queue.dequeue()) {
@@ -999,20 +1003,6 @@ pub const Editor = struct {
                         },
                     }
                 }
-
-                while (!self.deferred_action_queue.isEmpty()) {
-                    const action = self.deferred_action_queue.dequeue();
-                    switch (action) {
-                        .HandleResizeEvent => {
-                            self.handleResizeEvent(action.HandleResizeEvent);
-                        },
-                        .TryUpdateOnce => {
-                            try self.tryUpdateOnce();
-                        },
-                    }
-                }
-
-                self.logic_condition.broadcast();
 
                 while (!self.loop_queue.isEmpty()) {
                     const code = self.loop_queue.dequeue();
@@ -1026,6 +1016,18 @@ pub const Editor = struct {
                         },
                         .Retry => {
                             continue :start;
+                        },
+                    }
+                }
+
+                while (!self.deferred_action_queue.isEmpty()) {
+                    const action = self.deferred_action_queue.dequeue();
+                    switch (action) {
+                        .HandleResizeEvent => {
+                            self.handleResizeEvent(action.HandleResizeEvent);
+                        },
+                        .TryUpdateOnce => {
+                            try self.tryUpdateOnce();
                         },
                     }
                 }
@@ -1046,27 +1048,30 @@ pub const Editor = struct {
         pollfds[0].events = SystemCapabilities.POLL_IN;
         pollfds[1].events = SystemCapabilities.POLL_IN;
 
-        self.logic_cond_mutex.lock();
-        defer self.logic_cond_mutex.unlock();
         defer self.queue_condition.broadcast();
 
         while (self.is_editing) {
-            const rc = SystemCapabilities.poll(&pollfds, 2, std.math.maxInt(i32));
-            if (rc < 0) {
-                self.input_error = switch (std.os.errno(rc)) {
-                    .INTR => {
-                        continue;
-                    },
-                    .NOMEM => error.SystemResource,
-                    else => {
-                        unreachable;
-                    },
-                };
-                self.loop_queue.enqueue(.Exit) catch {
+            self.logic_cond_mutex.lock();
+
+            {
+                defer self.logic_cond_mutex.unlock();
+                const rc = SystemCapabilities.poll(&pollfds, 2, std.math.maxInt(i32));
+                if (rc < 0) {
+                    self.input_error = switch (std.os.errno(rc)) {
+                        .INTR => {
+                            continue;
+                        },
+                        .NOMEM => error.SystemResource,
+                        else => {
+                            unreachable;
+                        },
+                    };
+                    self.loop_queue.enqueue(.Exit) catch {
+                        break;
+                    };
+                    self.queue_condition.broadcast();
                     break;
-                };
-                self.queue_condition.broadcast();
-                break;
+                }
             }
 
             if (pollfds[1].revents & SystemCapabilities.POLL_IN != 0) {
@@ -1085,6 +1090,8 @@ pub const Editor = struct {
                 self.queue_condition.broadcast();
                 // Wait for the main thread to process the event, any further input between now and then will be
                 // picked up either immediately, or in the next cycle.
+                self.logic_cond_mutex.lock();
+                defer self.logic_cond_mutex.unlock();
                 self.logic_condition.wait(&self.logic_cond_mutex);
             }
         }
