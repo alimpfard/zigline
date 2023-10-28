@@ -510,7 +510,7 @@ pub const KeyCallbackMachine = struct {
     pub fn interrupted(self: *Self, editor: *Editor) void {
         self.sequence_length = 0;
         self.current_matching_keys.container.clearAndFree();
-        self.should_process_this_key = self.callback([1]Key{Key{ .code_point = ctrl('C') }}, editor, true);
+        self.should_process_this_key = self.callback(&[1]Key{.{ .code_point = ctrl('C') }}, editor, true);
     }
 
     pub fn shouldProcessLastPressedKey(self: *Self) bool {
@@ -554,6 +554,7 @@ pub const Configuration = struct {
 
     enable_bracketed_paste: bool = true,
     operation_mode: OperationMode = SystemCapabilities.default_operation_mode,
+    enable_signal_handling: bool = true,
 };
 
 fn vtMoveRelative(row: i64, col: i64) !void {
@@ -582,6 +583,24 @@ fn vtMoveRelative(row: i64, col: i64) !void {
         try writer.print("\x1b[{d}{c}", .{ c, y_op });
     }
 }
+
+var signalHandlingData: ?struct {
+    pipe: struct {
+        write: std.os.fd_t,
+        read: std.os.fd_t,
+    },
+    old_sigint: ?std.os.Sigaction = null,
+    old_sigwinch: ?std.os.Sigaction = null,
+
+    pub fn handleSignal(signo: i32) callconv(.C) void {
+        var f = std.fs.File{
+            .handle = signalHandlingData.?.pipe.write,
+            .capable_io_mode = .blocking,
+            .intended_io_mode = .blocking,
+        };
+        f.writer().writeInt(i32, signo, .Little) catch {};
+    }
+} = null;
 
 pub const Editor = struct {
     pub const Signal = enum {
@@ -694,6 +713,7 @@ pub const Editor = struct {
     on: struct {
         display_refresh: ?Callback = null,
         paste: ?Callback1([]const u32) = null,
+        interrupt_handled: ?Callback = null,
     } = .{},
 
     allocator: Allocator,
@@ -962,6 +982,31 @@ pub const Editor = struct {
             };
         }
 
+        if (self.configuration.enable_signal_handling) {
+            if (signalHandlingData == null) {
+                const pipe = try std.os.pipe();
+                signalHandlingData = .{
+                    .pipe = .{
+                        .read = pipe[0],
+                        .write = pipe[1],
+                    },
+                };
+
+                signalHandlingData.?.old_sigint = @as(std.os.Sigaction, undefined);
+                signalHandlingData.?.old_sigwinch = @as(std.os.Sigaction, undefined);
+                try std.os.sigaction(
+                    std.os.SIG.INT,
+                    &std.os.Sigaction{ .handler = .{ .handler = @TypeOf(signalHandlingData.?).handleSignal }, .mask = std.os.empty_sigset, .flags = 0 },
+                    &signalHandlingData.?.old_sigint.?,
+                );
+                try std.os.sigaction(
+                    std.os.SIG.WINCH,
+                    &std.os.Sigaction{ .handler = .{ .handler = @TypeOf(signalHandlingData.?).handleSignal }, .mask = std.os.empty_sigset, .flags = 0 },
+                    &signalHandlingData.?.old_sigwinch.?,
+                );
+            }
+        }
+
         start: while (true) {
             try self.initialize();
 
@@ -1021,10 +1066,10 @@ pub const Editor = struct {
                 while (!self.signal_queue.isEmpty()) {
                     switch (self.signal_queue.dequeue()) {
                         .SIGINT => {
-                            self.interrupted();
+                            self.interrupted() catch {};
                         },
                         .SIGWINCH => {
-                            self.resized();
+                            self.resized() catch {};
                         },
                     }
                 }
@@ -1049,7 +1094,7 @@ pub const Editor = struct {
                     const action = self.deferred_action_queue.dequeue();
                     switch (action) {
                         .HandleResizeEvent => {
-                            self.handleResizeEvent(action.HandleResizeEvent);
+                            try self.handleResizeEvent(action.HandleResizeEvent);
                         },
                         .TryUpdateOnce => {
                             try self.tryUpdateOnce();
@@ -1067,11 +1112,20 @@ pub const Editor = struct {
 
         std.debug.assert(self.thread_kill_pipe != null);
 
-        var pollfds = [_]std.os.system.pollfd{ undefined, undefined };
+        var pollfds = [_]std.os.system.pollfd{ undefined, undefined, undefined };
         SystemCapabilities.setPollFd(&pollfds[0], stdin.handle);
         SystemCapabilities.setPollFd(&pollfds[1], self.thread_kill_pipe.?.read);
         pollfds[0].events = SystemCapabilities.POLL_IN;
         pollfds[1].events = SystemCapabilities.POLL_IN;
+        pollfds[2].events = 0;
+
+        var nfds: std.os.nfds_t = 2;
+
+        if (self.configuration.enable_signal_handling) {
+            SystemCapabilities.setPollFd(&pollfds[2], signalHandlingData.?.pipe.read);
+            pollfds[2].events = SystemCapabilities.POLL_IN;
+            nfds = 3;
+        }
 
         defer self.queue_condition.broadcast();
 
@@ -1080,7 +1134,7 @@ pub const Editor = struct {
 
             {
                 defer self.logic_cond_mutex.unlock();
-                const rc = SystemCapabilities.poll(&pollfds, 2, std.math.maxInt(i32));
+                const rc = SystemCapabilities.poll(&pollfds, nfds, std.math.maxInt(i32));
                 if (rc < 0) {
                     self.input_error = switch (std.os.errno(rc)) {
                         .INTR => {
@@ -1104,6 +1158,39 @@ pub const Editor = struct {
                 var buf = [_]u8{0} ** 8;
                 _ = std.os.read(self.thread_kill_pipe.?.read, &buf) catch 0;
                 break;
+            }
+
+            if (pollfds[2].revents & SystemCapabilities.POLL_IN != 0) no_read: {
+                // A signal! Let's handle it.
+                var f = std.fs.File{
+                    .handle = signalHandlingData.?.pipe.read,
+                    .capable_io_mode = .blocking,
+                    .intended_io_mode = .blocking,
+                };
+                const signo = f.reader().readInt(i32, .Little) catch {
+                    break :no_read;
+                };
+                switch (signo) {
+                    std.os.SIG.INT => {
+                        self.signal_queue.enqueue(.SIGINT) catch {
+                            break :no_read;
+                        };
+                    },
+                    std.os.SIG.WINCH => {
+                        self.signal_queue.enqueue(.SIGWINCH) catch {
+                            break :no_read;
+                        };
+                    },
+                    else => {
+                        break :no_read;
+                    },
+                }
+                self.queue_condition.broadcast();
+                // Wait for the main thread to process the event, any further input between now and then will be
+                // picked up either immediately, or in the next cycle.
+                self.logic_cond_mutex.lock();
+                defer self.logic_cond_mutex.unlock();
+                self.logic_condition.wait(&self.logic_cond_mutex);
             }
 
             if (pollfds[0].revents & SystemCapabilities.POLL_IN != 0) {
@@ -1142,12 +1229,51 @@ pub const Editor = struct {
         self.initialized = true;
     }
 
-    pub fn interrupted(self: *Self) void {
-        _ = self;
+    pub fn interrupted(self: *Self) !void {
+        if (self.is_searching) {
+            return self.search_editor.?.interrupted();
+        }
+
+        if (!self.is_editing) {
+            return;
+        }
+
+        self.was_interrupted = true;
+        self.handleInterruptEvent();
+        if (!self.finished or !self.previous_interrupt_was_handled_as_interrupt) {
+            return;
+        }
+
+        self.finished = false;
+        {
+            var stream = std.io.bufferedWriter(std.io.getStdErr().writer());
+            try self.repositionCursor(&stream, true);
+            // FIXME: Suggestion display cleanup.
+            _ = try stream.write("\n");
+            try stream.flush();
+        }
+
+        self.buffer.container.clearAndFree();
+        self.chars_touched_in_the_middle = 0;
+        self.is_editing = false;
+        self.restore();
+        try self.loop_queue.enqueue(.Retry);
     }
 
-    pub fn resized(self: *Self) void {
-        _ = self;
+    pub fn resized(self: *Self) anyerror!void {
+        self.was_resized = true;
+        self.previous_num_columns = self.num_columns;
+        self.getTerminalSize();
+
+        if (!self.has_origin_reset_scheduled) {
+            // Reset the origin, but make sure it doesn't blow up if we fail to read it.
+            if (self.setOrigin(false)) {
+                try self.handleResizeEvent(false);
+            } else {
+                try self.deferred_action_queue.enqueue(.{ .HandleResizeEvent = true });
+                self.has_origin_reset_scheduled = true;
+            }
+        }
     }
 
     pub fn getCursor(self: *Self) usize {
@@ -1455,7 +1581,27 @@ pub const Editor = struct {
     }
 
     fn handleInterruptEvent(self: *Self) void {
-        _ = self;
+        self.was_interrupted = false;
+        self.previous_interrupt_was_handled_as_interrupt = false;
+
+        self.callback_machine.interrupted(self);
+        if (!self.callback_machine.shouldProcessLastPressedKey()) {
+            return;
+        }
+
+        self.previous_interrupt_was_handled_as_interrupt = true;
+
+        _ = std.io.getStdErr().write("^C") catch 0;
+
+        if (self.on.interrupt_handled) |*cb| {
+            cb.f(cb.context);
+        }
+
+        self.buffer.container.clearAndFree();
+        self.chars_touched_in_the_middle = 0;
+        self.cursor = 0;
+
+        _ = self.finish();
     }
 
     fn handleReadEvent(self: *Self) !void {
@@ -1782,9 +1928,29 @@ pub const Editor = struct {
         }
     }
 
-    fn handleResizeEvent(self: *Self, reset_origin: bool) void {
-        _ = self;
-        _ = reset_origin;
+    fn handleResizeEvent(self: *Self, reset_origin: bool) !void {
+        self.has_origin_reset_scheduled = false;
+        if (reset_origin and !self.setOrigin(false)) {
+            self.has_origin_reset_scheduled = true;
+            try self.deferred_action_queue.enqueue(.{ .HandleResizeEvent = true });
+            return;
+        }
+
+        self.setOriginValues(self.origin_row, 1);
+
+        {
+            var stream = std.io.bufferedWriter(std.io.getStdErr().writer());
+
+            try self.repositionCursor(&stream, true);
+            // FIXME: suggestion_display.redisplay();
+            try self.repositionCursor(&stream, false);
+
+            try stream.flush();
+        }
+
+        if (self.is_searching) {
+            try self.search_editor.?.resized();
+        }
     }
 
     fn ensureFreeLinesFromOrigin(self: *Self, count: usize) void {
