@@ -32,6 +32,12 @@ pub fn main() !void {
                 }) catch unreachable;
             }
         }
+
+        pub fn paste(self: *@This(), text: []const u32) void {
+            self.editor.insertCodePoint('[');
+            self.editor.insertUtf32(text);
+            self.editor.insertCodePoint(']');
+        }
     } = .{ .editor = &editor };
     editor.setHandler(&handler);
 

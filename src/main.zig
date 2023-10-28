@@ -665,10 +665,35 @@ pub const Editor = struct {
     const Callback = struct {
         f: *const fn (*anyopaque) void,
         context: *anyopaque,
+
+        pub fn makeHandler(comptime T: type, comptime InnerT: type, comptime name: []const u8) type {
+            return struct {
+                pub fn theHandler(context: *anyopaque) void {
+                    var ctx: T = @alignCast(@ptrCast(context));
+                    @call(.auto, @field(InnerT, name), .{ctx});
+                }
+            };
+        }
     };
+    fn Callback1(comptime T: type) type {
+        return struct {
+            f: *const fn (*anyopaque, T) void,
+            context: *anyopaque,
+
+            pub fn makeHandler(comptime U: type, comptime InnerT: type, comptime name: []const u8) type {
+                return struct {
+                    pub fn theHandler(context: *anyopaque, value: T) void {
+                        var ctx: U = @alignCast(@ptrCast(context));
+                        @call(.auto, @field(InnerT, name), .{ ctx, value });
+                    }
+                };
+            }
+        };
+    }
 
     on: struct {
         display_refresh: ?Callback = null,
+        paste: ?Callback1([]const u32) = null,
     } = .{},
 
     allocator: Allocator,
@@ -1646,8 +1671,11 @@ pub const Editor = struct {
                                     }
                                     if (is_in_paste and param1 == 201) {
                                         self.input_state = .Free;
-                                        // TODO: on_paste
-                                        if (self.paste_buffer.container.items.len > 0) {
+                                        if (self.on.paste) |*cb| {
+                                            cb.f(cb.context, self.paste_buffer.container.items);
+                                            self.paste_buffer.container.clearRetainingCapacity();
+                                        }
+                                        if (self.paste_buffer.size() > 0) {
                                             self.insertUtf32(self.paste_buffer.container.items);
                                         }
                                         continue;
@@ -1676,8 +1704,12 @@ pub const Editor = struct {
                         self.input_state = .GotEscape;
                         continue;
                     }
-                    // TODO: on_paste
-                    self.insertCodePoint(code_point);
+
+                    if (self.on.paste) |*_| {
+                        try self.paste_buffer.container.append(code_point);
+                    } else {
+                        self.insertCodePoint(code_point);
+                    }
                     continue;
                 },
                 .Free => {
@@ -2142,13 +2174,8 @@ pub const Editor = struct {
 
         inline for (@typeInfo(InnerT).Struct.decls) |decl| {
             var h = &@field(self.on, decl.name);
-            h.* = Callback{
-                .f = &struct {
-                    pub fn theHandler(context: *anyopaque) void {
-                        var ctx: T = @alignCast(@ptrCast(context));
-                        @call(.auto, @field(InnerT, decl.name), .{ctx});
-                    }
-                }.theHandler,
+            h.* = .{
+                .f = &@TypeOf(h.*.?).makeHandler(T, InnerT, decl.name).theHandler,
                 .context = handler,
             };
         }
