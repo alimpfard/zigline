@@ -2555,9 +2555,23 @@ pub const Editor = struct {
     }
 
     fn getTerminalSize(self: *Self) void {
-        // FIXME: Actually get the size.
         self.num_columns = 80;
         self.num_lines = 24;
+        if (!is_windows) {
+            var ws: std.os.system.winsize = undefined;
+            if (std.os.system.ioctl(std.io.getStdIn().handle, std.os.system.T.IOCGWINSZ, @intFromPtr(&ws)) != 0) {
+                var fd = std.os.system.open("/dev/tty", std.os.system.O.RDONLY, 0);
+                if (fd != -1) {
+                    _ = std.os.system.ioctl(@intCast(fd), std.os.system.T.IOCGWINSZ, @intFromPtr(&ws));
+                    _ = std.os.system.close(@intCast(fd));
+                } else {
+                    return;
+                }
+            }
+
+            self.num_columns = ws.ws_col;
+            self.num_lines = ws.ws_row;
+        }
     }
 
     pub fn goEnd(self: *Self) bool {
