@@ -1504,11 +1504,11 @@ pub const Editor = struct {
     }
 
     pub fn prohibitInput(self: *Self) void {
-        _ = self;
+        self.prohibit_input_processing = true;
     }
 
     pub fn allowInput(self: *Self) void {
-        _ = self;
+        self.prohibit_input_processing = false;
     }
 
     fn setDefaultKeybinds(self: *Self) !void {
@@ -2744,6 +2744,9 @@ pub const Editor = struct {
     }
 
     pub fn finishEdit(self: *Self) bool {
+        self.prohibitInput();
+        defer self.allowInput();
+
         _ = std.io.getStdErr().write("<EOF>\n") catch 0;
         if (!self.always_refresh) {
             self.input_error = error.Eof;
