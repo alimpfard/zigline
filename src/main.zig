@@ -165,7 +165,7 @@ fn utf8ValidRange(s: []const u8) usize {
     while (i < s.len) {
         // Fast path for ASCII sequences
         while (i + N <= s.len) : (i += N) {
-            const v = std.mem.readIntNative(usize, s[i..][0..N]);
+            const v = std.mem.readInt(usize, s[i..][0..N], builtin.cpu.arch.endian());
             if (v & MASK != 0) break;
             len += N;
         }
@@ -619,7 +619,7 @@ var signalHandlingData: ?struct {
             .capable_io_mode = .blocking,
             .intended_io_mode = .blocking,
         };
-        f.writer().writeInt(i32, signo, .Little) catch {};
+        f.writer().writeInt(i32, signo, .little) catch {};
     }
 } = null;
 
@@ -709,7 +709,7 @@ pub const Editor = struct {
         pub fn makeHandler(comptime T: type, comptime InnerT: type, comptime name: []const u8) type {
             return struct {
                 pub fn theHandler(context: *anyopaque) void {
-                    var ctx: T = @alignCast(@ptrCast(context));
+                    const ctx: T = @alignCast(@ptrCast(context));
                     @call(.auto, @field(InnerT, name), .{ctx});
                 }
             };
@@ -723,7 +723,7 @@ pub const Editor = struct {
             pub fn makeHandler(comptime U: type, comptime InnerT: type, comptime name: []const u8) type {
                 return struct {
                     pub fn theHandler(context: *anyopaque, value: T) void {
-                        var ctx: U = @alignCast(@ptrCast(context));
+                        const ctx: U = @alignCast(@ptrCast(context));
                         @call(.auto, @field(InnerT, name), .{ ctx, value });
                     }
                 };
@@ -820,7 +820,7 @@ pub const Editor = struct {
     signal_queue: Queue(Signal),
 
     pub fn init(allocator: Allocator, configuration: Configuration) Self {
-        var self = Self{
+        const self = Self{
             .allocator = allocator,
             .buffer = ArrayList(u32).init(allocator),
             .callback_machine = KeyCallbackMachine.init(allocator),
@@ -1131,7 +1131,7 @@ pub const Editor = struct {
     fn controlThreadMain(self: *Self) void {
         defer self.control_thread_exited = true;
 
-        var stdin = std.io.getStdIn();
+        const stdin = std.io.getStdIn();
 
         std.debug.assert(self.thread_kill_pipe != null);
 
@@ -1191,7 +1191,7 @@ pub const Editor = struct {
                         .capable_io_mode = .blocking,
                         .intended_io_mode = .blocking,
                     };
-                    const signo = f.reader().readInt(i32, .Little) catch {
+                    const signo = f.reader().readInt(i32, .little) catch {
                         break :no_read;
                     };
                     switch (signo) {
@@ -1998,7 +1998,7 @@ pub const Editor = struct {
 
         while (true) {
             more_junk_to_read = false;
-            var rc = SystemCapabilities.poll(&pollfds, 1, 0);
+            const rc = SystemCapabilities.poll(&pollfds, 1, 0);
             if (rc == 1 and pollfds[0].revents & SystemCapabilities.POLL_IN != 0) {
                 const nread = stdin.read(&buf) catch |err| {
                     self.finished = true;
@@ -2040,7 +2040,7 @@ pub const Editor = struct {
 
         while (state != .SawR) {
             var b = [1]u8{0};
-            var length = try stdin.read(&b);
+            const length = try stdin.read(&b);
             if (length == 0) {
                 logger.debug("Got EOF while reading DSR response", .{});
                 return error.Empty;
@@ -2172,7 +2172,7 @@ pub const Editor = struct {
         var found: bool = false;
 
         if (allow_empty or phrase.len > 0) {
-            var search_offset = self.search_offset;
+            const search_offset = self.search_offset;
             var i = self.history_cursor;
             while (i > 0) : (i -= 1) {
                 const entry = self.history.container.items[i - 1];
@@ -2259,7 +2259,7 @@ pub const Editor = struct {
             _ = buffered_output.flush() catch {};
         }
 
-        var has_cleaned_up = false;
+        const has_cleaned_up = false;
         // Someone changed the window size, figure it out
         // and react to it. We might need to redraw.
         if (self.was_resized) {
@@ -2280,7 +2280,7 @@ pub const Editor = struct {
         // Refreshing the display will cause the terminal to scroll,
         // so note that fact and bring the origin up, making sure to
         // reserve the space for however many lines we move it up.
-        var current_num_lines = self.numLines();
+        const current_num_lines = self.numLines();
         if (self.origin_row + current_num_lines > self.num_lines) {
             if (current_num_lines > self.num_lines) {
                 for (0..self.num_lines) |_| {
@@ -2364,7 +2364,7 @@ pub const Editor = struct {
         const InnerT = @TypeOf(handler.*);
 
         inline for (@typeInfo(InnerT).Struct.decls) |decl| {
-            var h = &@field(self.on, decl.name);
+            const h = &@field(self.on, decl.name);
             h.* = .{
                 .f = &@TypeOf(h.*.?).makeHandler(T, InnerT, decl.name).theHandler,
                 .context = handler,
@@ -2464,7 +2464,7 @@ pub const Editor = struct {
         try self.repositionCursor(&stderr, true);
         _ = try stream.write("\n");
 
-        var str = try self.getBufferedLine();
+        const str = try self.getBufferedLine();
         self.buffer.container.clearAndFree();
         self.chars_touched_in_the_middle = 0;
         self.is_editing = false;
@@ -2515,7 +2515,7 @@ pub const Editor = struct {
     }
 
     fn setOrigin(self: *Self, quit_on_error: bool) bool {
-        var position = self.vtDSR() catch |err| {
+        const position = self.vtDSR() catch |err| {
             if (quit_on_error) {
                 self.input_error = err;
                 _ = self.finish();
@@ -2541,7 +2541,7 @@ pub const Editor = struct {
 
     fn repositionCursor(self: *Self, output_stream: anytype, to_end: bool) !void {
         var cursor = self.cursor;
-        var saved_cursor = cursor;
+        const saved_cursor = cursor;
         if (to_end) {
             cursor = self.buffer.size();
         }
@@ -2586,7 +2586,7 @@ pub const Editor = struct {
             const system = if (builtin.link_libc and builtin.os.tag == .linux) std.os.linux else std.os.system;
             var ws: system.winsize = undefined;
             if (std.os.system.ioctl(std.io.getStdIn().handle, system.T.IOCGWINSZ, @intFromPtr(&ws)) != 0) {
-                var fd = std.os.system.open("/dev/tty", std.os.system.O.RDONLY, @as(std.os.mode_t, 0));
+                const fd = std.os.system.open("/dev/tty", std.os.system.O.RDONLY, @as(std.os.mode_t, 0));
                 if (fd != -1) {
                     _ = std.os.system.ioctl(@intCast(fd), system.T.IOCGWINSZ, @intFromPtr(&ws));
                     _ = std.os.system.close(@intCast(fd));
