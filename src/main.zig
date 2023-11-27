@@ -82,7 +82,7 @@ const SystemCapabilities = switch (builtin.os.tag) {
         }
 
         const pipe = (if (is_windows) struct {
-            pub fn pipe() anyerror![2]std.os.fd_t {
+            pub fn pipe() ![2]std.os.fd_t {
                 var rd: std.os.windows.HANDLE = undefined;
                 var wr: std.os.windows.HANDLE = undefined;
                 var attrs: std.os.windows.SECURITY_ATTRIBUTES = undefined;
@@ -91,7 +91,7 @@ const SystemCapabilities = switch (builtin.os.tag) {
                 return [2]std.os.fd_t{ @ptrCast(rd), @ptrCast(wr) };
             }
         } else struct {
-            pub fn pipe() anyerror![2]std.os.fd_t {
+            pub fn pipe() ![2]std.os.fd_t {
                 return std.os.pipe();
             }
         }).pipe;
@@ -619,6 +619,21 @@ var signalHandlingData: ?struct {
 } = null;
 
 pub const Editor = struct {
+    pub const Error =
+        std.mem.Allocator.Error ||
+        std.os.MMapError ||
+        std.os.OpenError ||
+        std.os.PipeError ||
+        std.os.ReadError ||
+        std.os.RealPathError ||
+        std.os.TermiosGetError ||
+        std.os.TermiosSetError ||
+        std.os.WriteError ||
+        error{ CodepointTooLarge, Utf8CannotEncodeSurrogateHalf } ||
+        error{ Empty, Eof, ReadFailure } ||
+        error{ EndOfStream, StreamTooLong, OperationNotSupported } ||
+        error{ SystemResource, ThreadQuotaExceeded };
+
     pub const Signal = enum {
         SIGWINCH,
     };
@@ -746,7 +761,7 @@ pub const Editor = struct {
     pre_search_buffer: ArrayList(u32),
     pending_chars: ArrayList(u8),
     incomplete_data: ArrayList(u8),
-    input_error: ?anyerror = null,
+    input_error: ?Error = null,
     returned_line: []const u8,
     cursor: usize = 0,
     drawn_cursor: usize = 0,
@@ -1238,7 +1253,7 @@ pub const Editor = struct {
         self.initialized = true;
     }
 
-    pub fn interrupted(self: *Self) anyerror!bool {
+    pub fn interrupted(self: *Self) Error!bool {
         if (self.is_searching) {
             return self.search_editor.?.interrupted();
         }
@@ -1273,7 +1288,7 @@ pub const Editor = struct {
         return false;
     }
 
-    pub fn resized(self: *Self) anyerror!void {
+    pub fn resized(self: *Self) Error!void {
         self.was_resized = true;
         self.previous_num_columns = self.num_columns;
         self.getTerminalSize();
@@ -1499,7 +1514,7 @@ pub const Editor = struct {
         self.prohibit_input_processing = false;
     }
 
-    fn eatErrors(comptime f: fn (*Self) anyerror!bool) fn (*Self) bool {
+    fn eatErrors(comptime f: fn (*Self) Error!bool) fn (*Self) bool {
         return struct {
             pub fn handler(self: *Self) bool {
                 return f(self) catch false;
