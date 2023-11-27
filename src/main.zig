@@ -106,6 +106,7 @@ const SystemCapabilities = switch (builtin.os.tag) {
         pub const V = std.os.linux.V;
         const ECHO = std.os.linux.ECHO;
         const ICANON = std.os.linux.ICANON;
+        const ISIG = std.os.linux.ISIG;
 
         pub const default_operation_mode = Configuration.OperationMode.Full;
 
@@ -118,7 +119,7 @@ const SystemCapabilities = switch (builtin.os.tag) {
         }
 
         pub fn clearEchoAndICanon(t: *Self.termios) void {
-            t.lflag &= ~ECHO & ~ICANON;
+            t.lflag &= ~ECHO & ~ICANON & ~ISIG;
         }
 
         pub fn getTermiosCC(t: Self.termios, cc: u32) u8 {
@@ -528,12 +529,6 @@ pub const KeyCallbackMachine = struct {
         try self.key_callbacks.container.append(inserted_entry);
     }
 
-    pub fn interrupted(self: *Self, editor: *Editor) void {
-        self.sequence_length = 0;
-        self.current_matching_keys.container.clearAndFree();
-        self.should_process_this_key = self.callback(&[1]Key{.{ .code_point = ctrl('C') }}, editor, true);
-    }
-
     pub fn shouldProcessLastPressedKey(self: *Self) bool {
         return self.should_process_this_key;
     }
@@ -625,7 +620,6 @@ var signalHandlingData: ?struct {
 
 pub const Editor = struct {
     pub const Signal = enum {
-        SIGINT,
         SIGWINCH,
     };
 
@@ -734,7 +728,6 @@ pub const Editor = struct {
     on: struct {
         display_refresh: ?Callback = null,
         paste: ?Callback1([]const u32) = null,
-        interrupt_handled: ?Callback = null,
     } = .{},
 
     allocator: Allocator,
@@ -787,7 +780,6 @@ pub const Editor = struct {
     termios: termios = undefined,
     default_termios: termios = undefined,
     was_interrupted: bool = false,
-    previous_interrupt_was_handled_as_interrupt: bool = false,
     was_resized: bool = false,
     history: ArrayList(HistoryEntry),
     history_cursor: usize = 0,
@@ -1088,9 +1080,6 @@ pub const Editor = struct {
 
                 while (!self.signal_queue.isEmpty()) {
                     switch (self.signal_queue.dequeue()) {
-                        .SIGINT => {
-                            self.interrupted() catch {};
-                        },
                         .SIGWINCH => {
                             self.resized() catch {};
                         },
@@ -1195,11 +1184,6 @@ pub const Editor = struct {
                         break :no_read;
                     };
                     switch (signo) {
-                        std.os.SIG.INT => {
-                            self.signal_queue.enqueue(.SIGINT) catch {
-                                break :no_read;
-                            };
-                        },
                         std.os.SIG.WINCH => {
                             self.signal_queue.enqueue(.SIGWINCH) catch {
                                 break :no_read;
@@ -1254,22 +1238,21 @@ pub const Editor = struct {
         self.initialized = true;
     }
 
-    pub fn interrupted(self: *Self) !void {
+    pub fn interrupted(self: *Self) anyerror!bool {
         if (self.is_searching) {
             return self.search_editor.?.interrupted();
         }
 
         if (!self.is_editing) {
-            return;
+            return false;
         }
 
-        self.was_interrupted = true;
-        self.handleInterruptEvent();
-        if (!self.finished or !self.previous_interrupt_was_handled_as_interrupt) {
-            return;
-        }
+        _ = std.io.getStdErr().write("^C") catch 0;
 
-        self.finished = false;
+        self.buffer.container.clearAndFree();
+        self.chars_touched_in_the_middle = 0;
+        self.cursor = 0;
+
         {
             var stream = std.io.bufferedWriter(std.io.getStdErr().writer());
             try self.repositionCursor(&stream, true);
@@ -1278,11 +1261,16 @@ pub const Editor = struct {
             try stream.flush();
         }
 
+        self.was_interrupted = true;
+
         self.buffer.container.clearAndFree();
         self.chars_touched_in_the_middle = 0;
         self.is_editing = false;
         self.restore();
         try self.loop_queue.enqueue(.Retry);
+        self.queue_condition.broadcast();
+
+        return false;
     }
 
     pub fn resized(self: *Self) anyerror!void {
@@ -1511,6 +1499,14 @@ pub const Editor = struct {
         self.prohibit_input_processing = false;
     }
 
+    fn eatErrors(comptime f: fn (*Self) anyerror!bool) fn (*Self) bool {
+        return struct {
+            pub fn handler(self: *Self) bool {
+                return f(self) catch false;
+            }
+        }.handler;
+    }
+
     fn setDefaultKeybinds(self: *Self) !void {
         try self.registerCharInputCallback('\n', &Self.finish);
         try self.registerCharInputCallback(ctrl('H'), &Self.eraseCharacterBackwards);
@@ -1518,6 +1514,7 @@ pub const Editor = struct {
         try self.registerCharInputCallback(127, &Self.eraseCharacterBackwards);
         try self.registerCharInputCallback(ctrl('D'), &Self.eraseCharacterForwards);
         try self.registerCharInputCallback(ctrl('A'), &Self.goHome);
+        try self.registerCharInputCallback(ctrl('C'), &eatErrors(Self.interrupted));
         try self.registerCharInputCallback(ctrl('E'), &Self.goEnd);
         try self.registerCharInputCallback(ctrl('L'), &Self.clearScreen);
     }
@@ -1588,10 +1585,6 @@ pub const Editor = struct {
     }
 
     fn tryUpdateOnce(self: *Self) !void {
-        if (self.was_interrupted) {
-            self.handleInterruptEvent();
-        }
-
         try self.handleReadEvent();
 
         if (self.always_refresh) {
@@ -1603,30 +1596,6 @@ pub const Editor = struct {
         if (self.finished) {
             try self.reallyQuitEventLoop();
         }
-    }
-
-    fn handleInterruptEvent(self: *Self) void {
-        self.was_interrupted = false;
-        self.previous_interrupt_was_handled_as_interrupt = false;
-
-        self.callback_machine.interrupted(self);
-        if (!self.callback_machine.shouldProcessLastPressedKey()) {
-            return;
-        }
-
-        self.previous_interrupt_was_handled_as_interrupt = true;
-
-        _ = std.io.getStdErr().write("^C") catch 0;
-
-        if (self.on.interrupt_handled) |*cb| {
-            cb.f(cb.context);
-        }
-
-        self.buffer.container.clearAndFree();
-        self.chars_touched_in_the_middle = 0;
-        self.cursor = 0;
-
-        _ = self.finish();
     }
 
     fn handleReadEvent(self: *Self) !void {
@@ -2253,6 +2222,11 @@ pub const Editor = struct {
     }
 
     fn refreshDisplay(self: *Self) !void {
+        if (self.was_interrupted) {
+            self.was_interrupted = false;
+            return;
+        }
+
         var buffered_output = std.io.bufferedWriter(std.io.getStdErr().writer());
         defer {
             self.shown_lines = self.currentPromptMetrics().linesWithAddition(self.cached_buffer_metrics, self.num_columns);
