@@ -1281,7 +1281,7 @@ pub const Editor = struct {
         self.buffer.container.clearAndFree();
         self.chars_touched_in_the_middle = 0;
         self.is_editing = false;
-        self.restore();
+        try self.restore();
         try self.loop_queue.enqueue(.Retry);
         self.queue_condition.broadcast();
 
@@ -2460,15 +2460,22 @@ pub const Editor = struct {
         self.returned_line = str;
 
         if (self.initialized) {
-            self.restore();
+            self.restore() catch {};
         }
 
         try self.loop_queue.enqueue(.Exit);
         self.queue_condition.broadcast();
     }
 
-    fn restore(self: *Self) void {
-        _ = self;
+    fn restore(self: *Self) !void {
+        if (!self.initialized) unreachable;
+
+        try setTermios(self.default_termios);
+        self.initialized = false;
+        if (self.configuration.enable_bracketed_paste) {
+            var stderr = std.io.getStdErr();
+            try stderr.writeAll("\x1b[?2004l");
+        }
     }
 
     fn currentPromptMetrics(self: *Self) StringMetrics {
