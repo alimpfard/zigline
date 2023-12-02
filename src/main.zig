@@ -520,6 +520,7 @@ pub const KeyCallbackMachine = struct {
                     }
                 }
                 if (match) {
+                    self.key_callbacks.container.items[j].deinit();
                     self.key_callbacks.container.items[j] = inserted_entry;
                     return;
                 }
