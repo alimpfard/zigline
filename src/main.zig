@@ -2157,7 +2157,7 @@ pub const Editor = struct {
         var found: bool = false;
 
         if (allow_empty or phrase.len > 0) {
-            const search_offset = self.search_offset;
+            var search_offset = self.search_offset;
             var i = self.history_cursor;
             while (i > 0) : (i -= 1) {
                 const entry = self.history.container.items[i - 1];
@@ -2173,8 +2173,8 @@ pub const Editor = struct {
                         found = true;
                         break;
                     }
-                    if (self.search_offset > 0) {
-                        self.search_offset -= 1;
+                    if (search_offset > 0) {
+                        search_offset -= 1;
                     }
                 }
             }
