@@ -96,6 +96,60 @@ const SystemCapabilities = switch (builtin.os.tag) {
             }
         }).pipe;
     },
+    .macos => struct {
+        const Self = @This();
+        pub const Sigaction = std.os.Sigaction;
+
+        pub const termios = std.os.termios;
+
+        pub const V = struct {
+            const EOF = 0;
+            const EOL = 1;
+            const ERASE = 3;
+            const INTR = 8;
+            const KILL = 5;
+            const MIN = 16;
+            const QUIT = 9;
+            const START = 12;
+            const STOP = 13;
+            const SUSP = 10;
+            const TIME = 17;
+        };
+        const ECHO: u32 = 0x8;
+        const ICANON: u32 = 0x100;
+        const ISIG: u32 = 0x80;
+
+        pub const default_operation_mode = Configuration.OperationMode.Full;
+
+        pub fn getTermios() !Self.termios {
+            return try std.os.tcgetattr(std.os.STDIN_FILENO);
+        }
+
+        pub fn setTermios(t: Self.termios) !void {
+            try std.os.tcsetattr(std.os.STDIN_FILENO, std.os.system.TCSA.NOW, t);
+        }
+
+        pub fn clearEchoAndICanon(t: *Self.termios) void {
+            t.lflag &= ~ECHO & ~ICANON & ~ISIG;
+        }
+
+        pub fn getTermiosCC(t: Self.termios, cc: u32) u8 {
+            return t.cc[cc];
+        }
+
+        pub const POLL_IN = std.os.system.POLL.IN;
+
+        pub fn setPollFd(p: *std.os.system.pollfd, f: std.os.fd_t) void {
+            p.fd = f;
+        }
+
+        const PollReturnType = if (builtin.link_libc) c_int else usize; // AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+        pub fn poll(fds: [*]std.os.system.pollfd, n: std.os.system.nfds_t, timeout: i32) PollReturnType {
+            return std.os.system.poll(fds, n, timeout);
+        }
+
+        pub const pipe = std.os.pipe;
+    },
     else => struct {
         const Self = @This();
         pub const Sigaction = std.os.Sigaction;
