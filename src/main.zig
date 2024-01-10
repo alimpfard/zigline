@@ -1135,15 +1135,20 @@ pub const Editor = struct {
             self.control_thread_exited = false;
             self.control_thread = try Thread.spawn(.{}, Self.controlThreadMain, .{self});
 
+            var had_incomplete_data_at_start = false;
             if (self.incomplete_data.container.items.len != 0) {
                 try self.deferred_action_queue.enqueue(DeferredAction{ .TryUpdateOnce = 0 });
-                self.queue_condition.broadcast();
+                had_incomplete_data_at_start = true;
             }
 
             // FIXME: Install signal handlers.
 
             while (true) {
-                self.queue_condition.wait(&self.queue_cond_mutex);
+                if (!had_incomplete_data_at_start) {
+                    self.queue_condition.wait(&self.queue_cond_mutex);
+                }
+                had_incomplete_data_at_start = false;
+
                 self.logic_cond_mutex.lock();
                 defer self.logic_cond_mutex.unlock();
                 defer self.logic_condition.broadcast();
