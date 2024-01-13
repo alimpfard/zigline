@@ -1149,8 +1149,6 @@ pub const Editor = struct {
                 }
                 had_incomplete_data_at_start = false;
 
-                self.logic_cond_mutex.lock();
-                defer self.logic_cond_mutex.unlock();
                 defer self.logic_condition.broadcast();
 
                 while (!self.signal_queue.isEmpty()) {
@@ -1283,11 +1281,11 @@ pub const Editor = struct {
                 }
 
                 self.deferred_action_queue.enqueue(DeferredAction{ .TryUpdateOnce = 0 }) catch {};
+                self.logic_cond_mutex.lock();
+                defer self.logic_cond_mutex.unlock();
                 self.queue_condition.broadcast();
                 // Wait for the main thread to process the event, any further input between now and then will be
                 // picked up either immediately, or in the next cycle.
-                self.logic_cond_mutex.lock();
-                defer self.logic_cond_mutex.unlock();
                 self.logic_condition.wait(&self.logic_cond_mutex);
             }
         }
