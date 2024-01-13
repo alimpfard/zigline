@@ -1032,9 +1032,29 @@ pub const Editor = struct {
         var array = ArrayList(u8).init(self.allocator);
         defer array.deinit();
 
-        try std.io.getStdIn().reader().streamUntilDelimiter(array.container.writer(), '\n', null);
+        streamUntilEol(std.io.getStdIn().reader(), array.container.writer()) catch |e| switch (e) {
+            error.EndOfStream => return error.Eof,
+            else => return e,
+        };
 
         return array.container.toOwnedSlice();
+    }
+
+    fn streamUntilEol(reader: anytype, writer: anytype) !void {
+        if (!is_windows) {
+            // eol is '\n', so we can just use streamUntilDelimiter.
+            return reader.streamUntilDelimiter(writer, '\n', null);
+        }
+
+        // Read until '\r', return if '\n' follows, otherwise keep reading.
+        while (true) {
+            try reader.streamUntilDelimiter(writer, '\r', null);
+            const byte = try reader.readByte();
+            if (byte == '\n')
+                return;
+            try writer.writeByte('\r');
+            try writer.writeByte(byte);
+        }
     }
 
     fn nicelyAskControlThreadToDie(self: *Self) !void {

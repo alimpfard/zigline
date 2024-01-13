@@ -49,7 +49,7 @@ pub fn main() Editor.Error!void {
         defer gpa.allocator().free(line);
 
         try editor.addToHistory(line);
-        std.log.info("line: {s}\n", .{line});
+        std.log.info("line ({} bytes): {s}\n", .{line.len, line});
 
         if (std.mem.eql(u8, line, "quit")) {
             break;
