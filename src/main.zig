@@ -682,11 +682,7 @@ var signalHandlingData: ?struct {
     old_sigwinch: ?SystemCapabilities.Sigaction = null,
 
     pub fn handleSignal(signo: i32) callconv(.C) void {
-        var f = std.fs.File{
-            .handle = signalHandlingData.?.pipe.write,
-            .capable_io_mode = .blocking,
-            .intended_io_mode = .blocking,
-        };
+        var f = std.fs.File{ .handle = signalHandlingData.?.pipe.write };
         f.writer().writeInt(i32, signo, .little) catch {};
     }
 } = null;
@@ -1286,11 +1282,7 @@ pub const Editor = struct {
             if (!is_windows) {
                 if (pollfds[2].revents & SystemCapabilities.POLL_IN != 0) no_read: {
                     // A signal! Let's handle it.
-                    var f = std.fs.File{
-                        .handle = signalHandlingData.?.pipe.read,
-                        .capable_io_mode = .blocking,
-                        .intended_io_mode = .blocking,
-                    };
+                    var f = std.fs.File{ .handle = signalHandlingData.?.pipe.read };
                     const signo = f.reader().readInt(i32, .little) catch {
                         break :no_read;
                     };
