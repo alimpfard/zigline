@@ -2713,7 +2713,7 @@ pub const Editor = struct {
             const system = if (builtin.link_libc and builtin.os.tag == .linux) std.os.linux else std.os.system;
             var ws: system.winsize = undefined;
             if (std.os.system.ioctl(std.io.getStdIn().handle, system.T.IOCGWINSZ, @intFromPtr(&ws)) != 0) {
-                const fd = std.os.system.open("/dev/tty", std.os.system.O.RDONLY, @as(std.os.mode_t, 0));
+                const fd = std.os.system.open("/dev/tty", .{ .ACCMODE = .RDONLY }, @as(std.os.mode_t, 0));
                 if (fd != -1) {
                     _ = std.os.system.ioctl(@intCast(fd), system.T.IOCGWINSZ, @intFromPtr(&ws));
                     _ = std.os.system.close(@intCast(fd));
