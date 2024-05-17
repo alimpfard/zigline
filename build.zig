@@ -16,12 +16,12 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     _ = b.addModule("zigline", .{
-        .root_source_file = .{ .path = "src/main.zig" },
+        .root_source_file = b.path("src/main.zig"),
     });
 
     const exe = b.addExecutable(.{
         .name = "zigline-test",
-        .root_source_file = .{ .path = "src/example.zig" },
+        .root_source_file = b.path("src/example.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -57,7 +57,7 @@ pub fn build(b: *std.Build) void {
     // Creates a step for unit testing. This only builds the test executable
     // but does not run it.
     const main_tests = b.addTest(.{
-        .root_source_file = .{ .path = "src/main.zig" },
+        .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
     });
