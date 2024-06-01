@@ -1689,7 +1689,7 @@ pub const Editor = struct {
         self.prohibit_input_processing = true;
         defer self.prohibit_input_processing = false;
 
-        var keybuf = [16]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+        var keybuf = [_]u8{0} ** 32;
 
         var stdin = std.io.getStdIn();
 
@@ -1997,11 +1997,11 @@ pub const Editor = struct {
             self.insertCodePoint(code_point);
         }
 
-        if (consumed_code_points == self.incomplete_data.container.items.len) {
+        if (input_it.i == self.incomplete_data.container.items.len) {
             self.incomplete_data.container.clearAndFree();
         } else {
-            for (consumed_code_points..self.incomplete_data.container.items.len) |_| {
-                _ = self.incomplete_data.container.orderedRemove(consumed_code_points);
+            for (input_it.i..self.incomplete_data.container.items.len) |_| {
+                _ = self.incomplete_data.container.orderedRemove(input_it.i);
             }
         }
 
@@ -2042,7 +2042,7 @@ pub const Editor = struct {
     }
 
     fn vtDSR(self: *Self) ![2]usize {
-        var buf = [16]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+        var buf = [_]u8{0} ** 32;
         var more_junk_to_read = false;
         var stdin = std.io.getStdIn();
         var pollfds = [1]std.posix.pollfd{undefined};

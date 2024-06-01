@@ -18,18 +18,29 @@ pub fn main() Editor.Error!void {
             self.editor.stripStyles();
             const buf = self.editor.getBuffer();
             for (buf, 0..) |c, i| {
-                self.editor.stylize(.{
-                    .begin = i,
-                    .end = i + 1,
-                }, .{
-                    .foreground = .{
-                        .rgb = [3]u8{
-                            @intCast(c % 26 * 10),
-                            @intCast(c / 26 * 10),
-                            @intCast(c % 10 * 10 + 150),
+                if (c > 0x7F) {
+                    self.editor.stylize(.{
+                        .begin = i,
+                        .end = i + 1,
+                    }, .{
+                        .foreground = .{
+                            .rgb = [3]u8{ 255, 0, 0 },
                         },
-                    },
-                }) catch unreachable;
+                    }) catch unreachable;
+                } else {
+                    self.editor.stylize(.{
+                        .begin = i,
+                        .end = i + 1,
+                    }, .{
+                        .foreground = .{
+                            .rgb = [3]u8{
+                                @intCast(c % 26 * 10),
+                                @intCast(c / 26 * 10),
+                                @intCast(c % 10 * 10 + 150),
+                            },
+                        },
+                    }) catch unreachable;
+                }
             }
         }
 
