@@ -1787,7 +1787,7 @@ pub const Editor = struct {
                     if (self.input_state == .CSIExpectFinal) {
                         self.input_state = self.previous_free_state;
                         const is_in_paste = self.input_state == .Paste;
-                        var it = std.mem.split(u8, csi.parameter_bytes.items, ";");
+                        var it = std.mem.splitScalar(u8, csi.parameter_bytes.items, ';');
                         while (it.next()) |parameter| {
                             if (std.fmt.parseInt(u8, parameter, 10) catch null) |value| {
                                 try csi_parameters.append(value);
