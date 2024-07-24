@@ -1055,12 +1055,12 @@ pub const Editor = struct {
 
                     signalHandlingData.?.old_sigint = @as(SystemCapabilities.Sigaction, undefined);
                     signalHandlingData.?.old_sigwinch = @as(SystemCapabilities.Sigaction, undefined);
-                    try std.posix.sigaction(
+                    std.posix.sigaction(
                         std.posix.SIG.INT,
                         &SystemCapabilities.Sigaction{ .handler = .{ .handler = @TypeOf(signalHandlingData.?).handleSignal }, .mask = std.posix.empty_sigset, .flags = 0 },
                         &signalHandlingData.?.old_sigint.?,
                     );
-                    try std.posix.sigaction(
+                    std.posix.sigaction(
                         std.posix.SIG.WINCH,
                         &SystemCapabilities.Sigaction{ .handler = .{ .handler = @TypeOf(signalHandlingData.?).handleSignal }, .mask = std.posix.empty_sigset, .flags = 0 },
                         &signalHandlingData.?.old_sigwinch.?,
@@ -2665,8 +2665,8 @@ pub const Editor = struct {
                 }
             }
 
-            self.num_columns = ws.ws_col;
-            self.num_lines = ws.ws_row;
+            self.num_columns = ws.col;
+            self.num_lines = ws.row;
         }
     }
 
