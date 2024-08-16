@@ -15,6 +15,21 @@ const should_enable_signal_handling = !is_windows and builtin.os.tag != .wasi;
 
 const logger = std.log.scoped(.zigline);
 
+fn Wrapped(comptime T: type) type {
+    return struct {
+        value: std.meta.Int(.unsigned, @bitSizeOf(T)),
+        const t = T;
+    };
+}
+
+fn fromWrapped(value: anytype) @TypeOf(value).t {
+    return @errorCast(@errorFromInt(value.value));
+}
+
+fn toWrapped(comptime T: type, value: anytype) Wrapped(T) {
+    return .{ .value = @intFromError(@as(T, @errorCast(value))) };
+}
+
 const SystemCapabilities = switch (builtin.os.tag) {
     // FIXME: Windows' console handling is a mess, and std doesn't have
     //        the necessary bindings to emulate termios on Windows.
@@ -42,6 +57,31 @@ const SystemCapabilities = switch (builtin.os.tag) {
         };
 
         pub const default_operation_mode = Configuration.OperationMode.NonInteractive;
+
+        pub const winsize = struct {
+            col: u16,
+            row: u16,
+        };
+        const getWinsize = if (builtin.os.tag == .windows) struct {
+            pub fn getWinsize(handle: anytype) !winsize {
+                var ws: std.posix.winsize = undefined;
+                if (std.c.ioctl(handle, std.posix.T.IOCGWINSZ, @intFromPtr(&ws)) != 0) {
+                    const fd = std.posix.open("/dev/tty", .{ .ACCMODE = .RDONLY }, @as(std.posix.mode_t, 0)) catch return;
+                    if (fd != -1) {
+                        _ = std.c.ioctl(@intCast(fd), std.posix.T.IOCGWINSZ, @intFromPtr(&ws));
+                        _ = std.posix.close(@intCast(fd));
+                    } else {
+                        return error.Invalid;
+                    }
+                }
+                return winsize{ .col = ws.ws_col, .row = ws.ws_row };
+            }
+        } else struct {
+            pub fn getWinsize(handle: anytype) !winsize {
+                _ = handle;
+                return winsize{ .col = 80, .row = 24 };
+            }
+        }.getWinsize;
 
         pub fn getTermios() !Self.termios {
             return .{};
@@ -71,8 +111,12 @@ const SystemCapabilities = switch (builtin.os.tag) {
 
         pub const POLL_IN = std.posix.POLL.RDNORM;
 
-        pub fn setPollFd(p: *std.posix.pollfd, f: *anyopaque) void {
-            p.fd = @ptrCast(f);
+        pub fn setPollFd(p: *std.posix.pollfd, f: anytype) void {
+            if (builtin.os.tag == .windows) {
+                p.fd = @ptrCast(f);
+            } else {
+                p.fd = f;
+            }
         }
 
         pub fn poll(fds: [*]std.posix.pollfd, n: std.posix.nfds_t, timeout: i32) c_int {
@@ -106,6 +150,22 @@ const SystemCapabilities = switch (builtin.os.tag) {
         pub const V = std.posix.V;
 
         pub const default_operation_mode = Configuration.OperationMode.Full;
+
+        pub fn getWinsize(handle: anytype) !std.posix.winsize {
+            var ws: std.posix.winsize = undefined;
+            const ioctl = if (builtin.os.tag == .linux) std.os.linux.ioctl else std.c.ioctl;
+            if (ioctl(handle, std.posix.T.IOCGWINSZ, @intFromPtr(&ws)) != 0) {
+                const fd = try std.posix.open("/dev/tty", .{ .ACCMODE = .RDONLY }, @as(std.posix.mode_t, 0));
+                if (fd != -1) {
+                    _ = ioctl(@intCast(fd), std.posix.T.IOCGWINSZ, @intFromPtr(&ws));
+                    _ = std.posix.close(@intCast(fd));
+                } else {
+                    return error.Invalid;
+                }
+            }
+
+            return ws;
+        }
 
         pub fn getTermios() !Self.termios {
             return try std.posix.tcgetattr(std.posix.STDIN_FILENO);
@@ -773,7 +833,7 @@ pub const Editor = struct {
     pre_search_buffer: ArrayList(u32),
     pending_chars: ArrayList(u8),
     incomplete_data: ArrayList(u8),
-    input_error: ?Error = null,
+    input_error: ?Wrapped(Error) = null, // ?Error behaves weirdly - `null` seems to be equal to whatever error number 0 represents, so the null state cannot be represented at all.
     returned_line: []const u8,
     cursor: usize = 0,
     drawn_cursor: usize = 0,
@@ -823,20 +883,291 @@ pub const Editor = struct {
     prohibit_input_processing: bool = false,
     have_unprocessed_read_event: bool = false,
     configuration: Configuration,
-    control_thread: ?Thread = null,
-    control_thread_exited: bool = false,
-    thread_kill_pipe: ?struct {
-        write: std.posix.fd_t,
-        read: std.posix.fd_t,
-    } = null,
+    event_loop: Loop,
 
-    queue_cond_mutex: Mutex = .{},
-    queue_condition: Condition = .{},
-    logic_cond_mutex: Mutex = .{},
-    logic_condition: Condition = .{},
-    loop_queue: Queue(LoopExitCode),
-    deferred_action_queue: Queue(DeferredAction),
-    signal_queue: Queue(Signal),
+    const Loop = if (builtin.os.tag == .wasi)
+        struct {
+            pub fn init(allocator: Allocator, configuration: Configuration) Loop {
+                _ = configuration;
+                _ = allocator;
+                return .{};
+            }
+
+            pub fn restart(self: *Loop) !void {
+                _ = self;
+            }
+
+            pub fn stop(self: *Loop) !void {
+                _ = self;
+            }
+
+            pub fn pump(self: *Loop) void {
+                _ = self;
+            }
+
+            pub const Process = struct {
+                pub fn done(self: *@This()) void {
+                    _ = self;
+                }
+            };
+
+            pub fn process(self: *Loop) !Process {
+                _ = self;
+                return Process{};
+            }
+
+            pub fn loopAction(self: *Loop, code: LoopExitCode) !void {
+                _ = self;
+                _ = code;
+            }
+
+            pub fn deferredInvoke(self: *Loop, action: DeferredAction) !void {
+                _ = self;
+                _ = action;
+            }
+
+            pub fn deinit(self: *Loop) void {
+                _ = self;
+            }
+
+            pub const HandleResult = struct {
+                e: ?Wrapped(error{ ZiglineEventLoopExit, ZiglineEventLoopRetry }),
+            };
+
+            pub fn handle(self: *Loop, handlers: anytype) !HandleResult {
+                _ = self;
+                _ = handlers;
+                return HandleResult{ .e = null };
+            }
+        }
+    else
+        struct {
+            enable_signal_handling: bool,
+            control_thread: ?Thread = null,
+            control_thread_exited: bool = false,
+            thread_kill_pipe: ?struct {
+                write: std.posix.fd_t,
+                read: std.posix.fd_t,
+            } = null,
+            queue_cond_mutex: Mutex = .{},
+            queue_condition: Condition = .{},
+            logic_cond_mutex: Mutex = .{},
+            logic_condition: Condition = .{},
+            loop_queue: Queue(LoopExitCode),
+            deferred_action_queue: Queue(DeferredAction),
+            signal_queue: Queue(Signal),
+            input_error: ?Wrapped(Error) = null,
+
+            pub fn init(allocator: Allocator, configuration: Configuration) Loop {
+                return .{
+                    .enable_signal_handling = configuration.enable_signal_handling,
+                    .loop_queue = Queue(LoopExitCode).init(allocator),
+                    .deferred_action_queue = Queue(DeferredAction).init(allocator),
+                    .signal_queue = Queue(Signal).init(allocator),
+                };
+            }
+
+            pub fn restart(self: *Loop) !void {
+                try self.stop();
+                self.control_thread_exited = false;
+                self.control_thread = try Thread.spawn(.{}, Loop.controlThreadMain, .{self});
+            }
+
+            pub fn stop(self: *Loop) !void {
+                if (self.control_thread) |t| {
+                    self.nicelyAskControlThreadToDie() catch {};
+                    self.logic_condition.broadcast();
+                    t.join();
+                }
+            }
+
+            pub fn pump(self: *Loop) void {
+                self.queue_condition.wait(&self.queue_cond_mutex);
+            }
+
+            fn nicelyAskControlThreadToDie(self: *Loop) !void {
+                if (self.control_thread_exited) {
+                    return;
+                }
+
+                // In the absence of way to interrupt threads, we're just gonna write to it and hope it dies on its own pace.
+                if (self.thread_kill_pipe) |pipes| {
+                    _ = std.posix.write(pipes.write, "x") catch 0;
+                }
+            }
+
+            pub fn deinit(self: *Loop) void {
+                self.loop_queue.deinit();
+                self.deferred_action_queue.deinit();
+                self.signal_queue.deinit();
+            }
+
+            const Process = struct {
+                loop: *Loop,
+                pub fn done(self: *@This()) void {
+                    self.loop.queue_cond_mutex.unlock();
+                }
+            };
+
+            pub fn process(self: *Loop) !Process {
+                self.queue_cond_mutex.lock();
+
+                if (self.thread_kill_pipe == null) {
+                    const pipe = try SystemCapabilities.pipe();
+                    self.thread_kill_pipe = .{
+                        .read = pipe[0],
+                        .write = pipe[1],
+                    };
+                }
+
+                return Process{ .loop = self };
+            }
+
+            pub fn loopAction(self: *Loop, code: LoopExitCode) !void {
+                try self.loop_queue.enqueue(code);
+                self.queue_condition.broadcast();
+            }
+
+            pub fn deferredInvoke(self: *Loop, action: DeferredAction) !void {
+                try self.deferred_action_queue.enqueue(action);
+            }
+
+            fn controlThreadMain(self: *Loop) void {
+                defer self.control_thread_exited = true;
+
+                const stdin = std.io.getStdIn();
+
+                std.debug.assert(self.thread_kill_pipe != null);
+
+                var pollfds = [_]std.posix.pollfd{ undefined, undefined, undefined };
+                SystemCapabilities.setPollFd(&pollfds[0], stdin.handle);
+                SystemCapabilities.setPollFd(&pollfds[1], self.thread_kill_pipe.?.read);
+                pollfds[0].events = SystemCapabilities.POLL_IN;
+                pollfds[1].events = SystemCapabilities.POLL_IN;
+                pollfds[2].events = 0;
+
+                var nfds: std.posix.nfds_t = 2;
+
+                if (self.enable_signal_handling) {
+                    SystemCapabilities.setPollFd(&pollfds[2], signalHandlingData.?.pipe.read);
+                    pollfds[2].events = SystemCapabilities.POLL_IN;
+                    nfds = 3;
+                }
+
+                defer self.queue_condition.broadcast();
+
+                while (true) {
+                    self.logic_cond_mutex.lock();
+
+                    {
+                        defer self.logic_cond_mutex.unlock();
+                        const rc = SystemCapabilities.poll(&pollfds, nfds, std.math.maxInt(i32));
+                        if (rc < 0) {
+                            self.input_error = switch (std.posix.errno(rc)) {
+                                .INTR => {
+                                    continue;
+                                },
+                                .NOMEM => toWrapped(Error, error.SystemResource),
+                                else => {
+                                    unreachable;
+                                },
+                            };
+                            self.loop_queue.enqueue(.Exit) catch {
+                                break;
+                            };
+                            self.queue_condition.broadcast();
+                            break;
+                        }
+                    }
+
+                    if (pollfds[1].revents & SystemCapabilities.POLL_IN != 0) {
+                        // We're supposed to die...after draining the pipe.
+                        var buf = [_]u8{0} ** 8;
+                        _ = std.posix.read(self.thread_kill_pipe.?.read, &buf) catch 0;
+                        break;
+                    }
+
+                    if (!is_windows) {
+                        if (pollfds[2].revents & SystemCapabilities.POLL_IN != 0) no_read: {
+                            // A signal! Let's handle it.
+                            var f = std.fs.File{ .handle = signalHandlingData.?.pipe.read };
+                            const signo = f.reader().readInt(i32, .little) catch {
+                                break :no_read;
+                            };
+                            switch (signo) {
+                                std.posix.SIG.WINCH => {
+                                    self.signal_queue.enqueue(.SIGWINCH) catch {
+                                        break :no_read;
+                                    };
+                                },
+                                else => {
+                                    break :no_read;
+                                },
+                            }
+                            self.queue_condition.broadcast();
+                            // Wait for the main thread to process the event, any further input between now and then will be
+                            // picked up either immediately, or in the next cycle.
+                            self.logic_cond_mutex.lock();
+                            defer self.logic_cond_mutex.unlock();
+                            self.logic_condition.wait(&self.logic_cond_mutex);
+                        }
+                    }
+
+                    if (pollfds[0].revents & SystemCapabilities.POLL_IN != 0) {
+                        self.deferred_action_queue.enqueue(DeferredAction{ .TryUpdateOnce = 0 }) catch {};
+                        self.logic_cond_mutex.lock();
+                        defer self.logic_cond_mutex.unlock();
+                        self.queue_condition.broadcast();
+                        // Wait for the main thread to process the event, any further input between now and then will be
+                        // picked up either immediately, or in the next cycle.
+                        self.logic_condition.wait(&self.logic_cond_mutex);
+                    }
+                }
+            }
+
+            pub const HandleResult = struct {
+                const Error = error{ ZiglineEventLoopExit, ZiglineEventLoopRetry };
+                e: ?Wrapped(@This().Error),
+            };
+            fn handleSignalOrLoopAction(self: *Loop, handlers: anytype) !void {
+                while (!self.signal_queue.isEmpty()) {
+                    const signal = self.signal_queue.dequeue();
+                    try handlers.signal.handleEvent(signal);
+                }
+
+                while (!self.loop_queue.isEmpty()) {
+                    const code = self.loop_queue.dequeue();
+                    switch (code) {
+                        .Exit => {
+                            return error.ZiglineEventLoopExit;
+                        },
+                        .Retry => {
+                            return error.ZiglineEventLoopRetry;
+                        },
+                    }
+                }
+            }
+
+            pub fn handle(self: *Loop, handlers: anytype) !HandleResult {
+                defer self.logic_condition.broadcast();
+
+                while (!self.signal_queue.isEmpty() or !self.loop_queue.isEmpty() or !self.deferred_action_queue.isEmpty()) {
+                    try self.handleSignalOrLoopAction(handlers);
+
+                    while (!self.deferred_action_queue.isEmpty()) {
+                        const action = self.deferred_action_queue.dequeue();
+                        try handlers.deferred_action.handleEvent(action);
+                        try self.handleSignalOrLoopAction(handlers);
+                    }
+
+                    if (self.input_error) |e| {
+                        return fromWrapped(e);
+                    }
+                }
+
+                return .{ .e = null };
+            }
+        };
 
     pub fn init(allocator: Allocator, configuration: Configuration) Self {
         const self = Self{
@@ -853,24 +1184,17 @@ pub const Editor = struct {
             .new_prompt = ArrayList(u8).init(allocator),
             .paste_buffer = ArrayList(u32).init(allocator),
             .configuration = configuration,
-            .loop_queue = Queue(LoopExitCode).init(allocator),
-            .deferred_action_queue = Queue(DeferredAction).init(allocator),
-            .signal_queue = Queue(Signal).init(allocator),
             .cached_prompt_metrics = StringMetrics.init(allocator),
             .old_prompt_metrics = StringMetrics.init(allocator),
             .cached_buffer_metrics = StringMetrics.init(allocator),
+            .event_loop = Loop.init(allocator, configuration),
         };
 
         return self;
     }
 
     pub fn deinit(self: *Self) void {
-        if (self.control_thread) |t| {
-            self.nicelyAskControlThreadToDie() catch {};
-            self.logic_condition.broadcast();
-            t.join();
-        }
-
+        self.event_loop.stop() catch {};
         self.buffer.deinit();
         self.pre_search_buffer.deinit();
         self.pending_chars.deinit();
@@ -880,12 +1204,10 @@ pub const Editor = struct {
         self.new_prompt.deinit();
         self.paste_buffer.deinit();
         self.current_spans.deinit();
-        self.loop_queue.deinit();
-        self.signal_queue.deinit();
-        self.deferred_action_queue.deinit();
         self.callback_machine.deinit();
         self.cached_buffer_metrics.deinit();
         self.cached_prompt_metrics.deinit();
+        self.event_loop.deinit();
     }
 
     pub fn reFetchDefaultTermios(self: *Self) !void {
@@ -1014,33 +1336,14 @@ pub const Editor = struct {
         }
     }
 
-    fn nicelyAskControlThreadToDie(self: *Self) !void {
-        if (self.control_thread_exited) {
-            return;
-        }
-
-        // In the absence of way to interrupt threads, we're just gonna write to it and hope it dies on its own pace.
-        if (self.thread_kill_pipe) |pipes| {
-            _ = std.posix.write(pipes.write, "x") catch 0;
-        }
-    }
-
     pub fn getLine(self: *Self, prompt: []const u8) ![]const u8 {
         if (self.configuration.operation_mode == .NonInteractive) {
             // Disable all the fancy stuff, use a plain read.
             return self.getLineNonInteractive(prompt);
         }
 
-        self.queue_cond_mutex.lock();
-        defer self.queue_cond_mutex.unlock();
-
-        if (self.thread_kill_pipe == null) {
-            const pipe = try SystemCapabilities.pipe();
-            self.thread_kill_pipe = .{
-                .read = pipe[0],
-                .write = pipe[1],
-            };
-        }
+        var loop_handle = try self.event_loop.process();
+        defer loop_handle.done();
 
         if (should_enable_signal_handling) {
             if (self.configuration.enable_signal_handling) {
@@ -1103,18 +1406,11 @@ pub const Editor = struct {
 
             try self.refreshDisplay();
 
-            if (self.control_thread) |t| {
-                try self.nicelyAskControlThreadToDie();
-                self.logic_condition.broadcast();
-                t.join();
-            }
-
-            self.control_thread_exited = false;
-            self.control_thread = try Thread.spawn(.{}, Self.controlThreadMain, .{self});
+            try self.event_loop.restart();
 
             var had_incomplete_data_at_start = false;
             if (self.incomplete_data.container.items.len != 0) {
-                try self.deferred_action_queue.enqueue(DeferredAction{ .TryUpdateOnce = 0 });
+                try self.event_loop.deferredInvoke(.{ .TryUpdateOnce = 0 });
                 had_incomplete_data_at_start = true;
             }
 
@@ -1122,144 +1418,58 @@ pub const Editor = struct {
 
             while (true) {
                 if (!had_incomplete_data_at_start) {
-                    self.queue_condition.wait(&self.queue_cond_mutex);
+                    self.event_loop.pump();
                 }
                 had_incomplete_data_at_start = false;
 
-                defer self.logic_condition.broadcast();
+                const result = self.event_loop.handle(.{
+                    .signal = struct {
+                        editor: *Self,
 
-                while (!self.signal_queue.isEmpty()) {
-                    switch (self.signal_queue.dequeue()) {
-                        .SIGWINCH => {
-                            self.resized() catch {};
-                        },
-                    }
-                }
+                        pub fn handleEvent(s: @This(), event: Signal) !void {
+                            switch (event) {
+                                .SIGWINCH => {
+                                    try s.editor.resized();
+                                },
+                            }
+                        }
+                    }{ .editor = self },
 
-                while (!self.loop_queue.isEmpty()) {
-                    const code = self.loop_queue.dequeue();
-                    switch (code) {
-                        .Exit => {
+                    .deferred_action = struct {
+                        editor: *Self,
+                        pub fn handleEvent(s: @This(), action: DeferredAction) !void {
+                            switch (action) {
+                                .HandleResizeEvent => {
+                                    try s.editor.handleResizeEvent(action.HandleResizeEvent);
+                                },
+                                .TryUpdateOnce => {
+                                    try s.editor.tryUpdateOnce();
+                                },
+                            }
+                        }
+                    }{ .editor = self },
+                }) catch |e| switch (e) {
+                    error.ZiglineEventLoopExit, error.ZiglineEventLoopRetry => Self.Loop.HandleResult{ .e = toWrapped(Self.Loop.HandleResult.Error, e) },
+                    else => b: {
+                        self.input_error = toWrapped(Error, e);
+                        break :b Self.Loop.HandleResult{ .e = null };
+                    },
+                };
+
+                if (result.e) |err| {
+                    switch (fromWrapped(err)) {
+                        error.ZiglineEventLoopExit => {
                             self.finished = false;
-                            if (self.input_error) |err| {
-                                return err;
+                            if (self.input_error) |e| {
+                                return fromWrapped(e);
                             }
                             return self.returned_line;
                         },
-                        .Retry => {
+                        error.ZiglineEventLoopRetry => {
                             continue :start;
                         },
                     }
                 }
-
-                while (!self.deferred_action_queue.isEmpty()) {
-                    const action = self.deferred_action_queue.dequeue();
-                    switch (action) {
-                        .HandleResizeEvent => {
-                            try self.handleResizeEvent(action.HandleResizeEvent);
-                        },
-                        .TryUpdateOnce => {
-                            try self.tryUpdateOnce();
-                        },
-                    }
-                }
-            }
-        }
-    }
-
-    fn controlThreadMain(self: *Self) void {
-        defer self.control_thread_exited = true;
-
-        const stdin = std.io.getStdIn();
-
-        std.debug.assert(self.thread_kill_pipe != null);
-
-        var pollfds = [_]std.posix.pollfd{ undefined, undefined, undefined };
-        SystemCapabilities.setPollFd(&pollfds[0], stdin.handle);
-        SystemCapabilities.setPollFd(&pollfds[1], self.thread_kill_pipe.?.read);
-        pollfds[0].events = SystemCapabilities.POLL_IN;
-        pollfds[1].events = SystemCapabilities.POLL_IN;
-        pollfds[2].events = 0;
-
-        var nfds: std.posix.nfds_t = 2;
-
-        if (self.configuration.enable_signal_handling) {
-            SystemCapabilities.setPollFd(&pollfds[2], signalHandlingData.?.pipe.read);
-            pollfds[2].events = SystemCapabilities.POLL_IN;
-            nfds = 3;
-        }
-
-        defer self.queue_condition.broadcast();
-
-        while (self.is_editing) {
-            self.logic_cond_mutex.lock();
-
-            {
-                defer self.logic_cond_mutex.unlock();
-                const rc = SystemCapabilities.poll(&pollfds, nfds, std.math.maxInt(i32));
-                if (rc < 0) {
-                    self.input_error = switch (std.posix.errno(rc)) {
-                        .INTR => {
-                            continue;
-                        },
-                        .NOMEM => error.SystemResource,
-                        else => {
-                            unreachable;
-                        },
-                    };
-                    self.loop_queue.enqueue(.Exit) catch {
-                        break;
-                    };
-                    self.queue_condition.broadcast();
-                    break;
-                }
-            }
-
-            if (pollfds[1].revents & SystemCapabilities.POLL_IN != 0) {
-                // We're supposed to die...after draining the pipe.
-                var buf = [_]u8{0} ** 8;
-                _ = std.posix.read(self.thread_kill_pipe.?.read, &buf) catch 0;
-                break;
-            }
-
-            if (!is_windows) {
-                if (pollfds[2].revents & SystemCapabilities.POLL_IN != 0) no_read: {
-                    // A signal! Let's handle it.
-                    var f = std.fs.File{ .handle = signalHandlingData.?.pipe.read };
-                    const signo = f.reader().readInt(i32, .little) catch {
-                        break :no_read;
-                    };
-                    switch (signo) {
-                        std.posix.SIG.WINCH => {
-                            self.signal_queue.enqueue(.SIGWINCH) catch {
-                                break :no_read;
-                            };
-                        },
-                        else => {
-                            break :no_read;
-                        },
-                    }
-                    self.queue_condition.broadcast();
-                    // Wait for the main thread to process the event, any further input between now and then will be
-                    // picked up either immediately, or in the next cycle.
-                    self.logic_cond_mutex.lock();
-                    defer self.logic_cond_mutex.unlock();
-                    self.logic_condition.wait(&self.logic_cond_mutex);
-                }
-            }
-
-            if (pollfds[0].revents & SystemCapabilities.POLL_IN != 0) {
-                if (!self.is_editing) {
-                    break;
-                }
-
-                self.deferred_action_queue.enqueue(DeferredAction{ .TryUpdateOnce = 0 }) catch {};
-                self.logic_cond_mutex.lock();
-                defer self.logic_cond_mutex.unlock();
-                self.queue_condition.broadcast();
-                // Wait for the main thread to process the event, any further input between now and then will be
-                // picked up either immediately, or in the next cycle.
-                self.logic_condition.wait(&self.logic_cond_mutex);
             }
         }
     }
@@ -1313,8 +1523,7 @@ pub const Editor = struct {
         self.chars_touched_in_the_middle = 0;
         self.is_editing = false;
         try self.restore();
-        try self.loop_queue.enqueue(.Retry);
-        self.queue_condition.broadcast();
+        try self.event_loop.loopAction(.Retry);
 
         return false;
     }
@@ -1329,7 +1538,7 @@ pub const Editor = struct {
             if (self.setOrigin(false)) {
                 try self.handleResizeEvent(false);
             } else {
-                try self.deferred_action_queue.enqueue(.{ .HandleResizeEvent = true });
+                try self.event_loop.deferredInvoke(.{ .HandleResizeEvent = true });
                 self.has_origin_reset_scheduled = true;
             }
         }
@@ -1697,12 +1906,12 @@ pub const Editor = struct {
             const nread = stdin.read(&keybuf) catch |err| {
                 // Zig eats EINTR, so we'll have to delay resize handling until the next read.
                 self.finished = true;
-                self.input_error = err;
+                self.input_error = toWrapped(Error, err);
                 return;
             };
 
             if (nread == 0) {
-                self.input_error = error.Empty;
+                self.input_error = toWrapped(Error, error.Empty);
                 self.finished = true;
                 return;
             }
@@ -2006,8 +2215,7 @@ pub const Editor = struct {
         }
 
         if (self.incomplete_data.container.items.len != 0 and !self.finished) {
-            try self.loop_queue.enqueue(.Retry);
-            self.queue_condition.broadcast();
+            try self.event_loop.loopAction(.Retry);
         }
     }
 
@@ -2015,7 +2223,7 @@ pub const Editor = struct {
         self.has_origin_reset_scheduled = false;
         if (reset_origin and !self.setOrigin(false)) {
             self.has_origin_reset_scheduled = true;
-            try self.deferred_action_queue.enqueue(.{ .HandleResizeEvent = true });
+            try self.event_loop.deferredInvoke(.{ .HandleResizeEvent = true });
             return;
         }
 
@@ -2060,7 +2268,7 @@ pub const Editor = struct {
             if (rc == 1 and pollfds[0].revents & SystemCapabilities.POLL_IN != 0) {
                 const nread = stdin.read(&buf) catch |err| {
                     self.finished = true;
-                    self.input_error = err;
+                    self.input_error = toWrapped(Error, err);
                     return error.ReadFailure;
                 };
                 if (nread == 0) {
@@ -2075,7 +2283,7 @@ pub const Editor = struct {
         }
 
         if (self.input_error) |err| {
-            return err;
+            return fromWrapped(err);
         }
 
         var stderr = std.io.getStdErr();
@@ -2537,8 +2745,7 @@ pub const Editor = struct {
             self.restore() catch {};
         }
 
-        try self.loop_queue.enqueue(.Exit);
-        self.queue_condition.broadcast();
+        try self.event_loop.loopAction(.Exit);
     }
 
     fn restore(self: *Self) !void {
@@ -2587,7 +2794,7 @@ pub const Editor = struct {
     fn setOrigin(self: *Self, quit_on_error: bool) bool {
         const position = self.vtDSR() catch |err| {
             if (quit_on_error) {
-                self.input_error = err;
+                self.input_error = toWrapped(Error, err);
                 _ = self.finish();
             }
             return false;
@@ -2653,18 +2860,9 @@ pub const Editor = struct {
         self.num_columns = 80;
         self.num_lines = 24;
         if (!is_windows) {
-            const ioctl = if (builtin.os.tag == .linux) std.os.linux.ioctl else std.c.ioctl;
-            var ws: std.posix.winsize = undefined;
-            if (ioctl(std.io.getStdIn().handle, std.posix.T.IOCGWINSZ, @intFromPtr(&ws)) != 0) {
-                const fd = std.posix.open("/dev/tty", .{ .ACCMODE = .RDONLY }, @as(std.posix.mode_t, 0)) catch return;
-                if (fd != -1) {
-                    _ = ioctl(@intCast(fd), std.posix.T.IOCGWINSZ, @intFromPtr(&ws));
-                    _ = std.posix.close(@intCast(fd));
-                } else {
-                    return;
-                }
-            }
-
+            const ws = SystemCapabilities.getWinsize(std.io.getStdIn().handle) catch {
+                return;
+            };
             self.num_columns = ws.col;
             self.num_lines = ws.row;
         }
@@ -2819,7 +3017,7 @@ pub const Editor = struct {
 
         _ = std.io.getStdErr().write("<EOF>\n") catch 0;
         if (!self.always_refresh) {
-            self.input_error = error.Eof;
+            self.input_error = toWrapped(Error, error.Eof);
             _ = self.finish();
             self.reallyQuitEventLoop() catch {};
         }
