@@ -62,8 +62,8 @@ fn DeinitingArrayList(comptime T: type, comptime deinit_fn: anytype) type {
 fn deinitFnFor(comptime T: type) fn (ptr: *T) void {
     const t = @typeInfo(T);
     switch (t) {
-        .Struct => {
-            for (t.Struct.decls) |decl| {
+        .@"struct" => {
+            for (t.@"struct".decls) |decl| {
                 if (std.mem.eql(u8, decl.name, "deinit")) {
                     return T.deinit;
                 }

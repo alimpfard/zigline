@@ -2628,13 +2628,13 @@ pub const Editor = struct {
 
     pub fn setHandler(self: *Self, handler: anytype) void {
         const T = @TypeOf(handler);
-        if (@typeInfo(T) != .Pointer) {
+        if (@typeInfo(T) != .pointer) {
             @compileError("Handler must be a pointer type");
         }
 
         const InnerT = @TypeOf(handler.*);
 
-        inline for (@typeInfo(InnerT).Struct.decls) |decl| {
+        inline for (@typeInfo(InnerT).@"struct".decls) |decl| {
             const h = &@field(self.on, decl.name);
             h.* = .{
                 .f = &@TypeOf(h.*.?).makeHandler(T, InnerT, decl.name).theHandler,
