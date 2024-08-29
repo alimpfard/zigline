@@ -11,7 +11,7 @@ const Queue = sane.Queue;
 
 const builtin = @import("builtin");
 const is_windows = builtin.os.tag == .windows;
-const should_enable_signal_handling = !is_windows and builtin.os.tag != .wasi;
+const should_enable_signal_handling = !is_windows and builtin.os.tag != .wasi and builtin.os.tag != .uefi;
 
 const logger = std.log.scoped(.zigline);
 
@@ -30,15 +30,18 @@ fn toWrapped(comptime T: type, value: anytype) Wrapped(T) {
     return .{ .value = @intFromError(@as(T, @errorCast(value))) };
 }
 
-const SystemCapabilities = switch (builtin.os.tag) {
+pub const SystemCapabilities = switch (builtin.os.tag) {
     // FIXME: Windows' console handling is a mess, and std doesn't have
     //        the necessary bindings to emulate termios on Windows.
     //        For now, we just ignore the termios problem, which will lead to
     //        garbled input; so we just ignore all that too and set the default
     //        execution mode to "NonInteractive".
-    .windows, .wasi => struct {
+    .windows,
+    .wasi,
+    => struct {
         const Self = @This();
         pub const Sigaction = struct {}; // This is not implemented in Zig, and we're not about to try.
+        pub const pollfd = std.posix.pollfd;
 
         pub const termios = struct {};
         pub const V = enum {
@@ -57,6 +60,10 @@ const SystemCapabilities = switch (builtin.os.tag) {
         };
 
         pub const default_operation_mode = Configuration.OperationMode.NonInteractive;
+
+        pub const getStdIn = std.io.getStdIn;
+        pub const getStdOut = std.io.getStdOut;
+        pub const getStdErr = std.io.getStdErr;
 
         pub const winsize = struct {
             col: u16,
@@ -111,7 +118,7 @@ const SystemCapabilities = switch (builtin.os.tag) {
 
         pub const POLL_IN = std.posix.POLL.RDNORM;
 
-        pub fn setPollFd(p: *std.posix.pollfd, f: anytype) void {
+        pub fn setPollFd(p: *Self.pollfd, f: anytype) void {
             if (builtin.os.tag == .windows) {
                 p.fd = @ptrCast(f);
             } else {
@@ -119,7 +126,8 @@ const SystemCapabilities = switch (builtin.os.tag) {
             }
         }
 
-        pub fn poll(fds: [*]std.posix.pollfd, n: std.posix.nfds_t, timeout: i32) c_int {
+        pub const nfds_t = std.posix.nfds_t;
+        pub fn poll(fds: [*]Self.pollfd, n: nfds_t, timeout: i32) c_int {
             // std.posix.poll() has a Windows implementation but doesn't accept the second arg, only a slice.
             _ = timeout;
             fds[n - 1].revents = Self.POLL_IN;
@@ -141,15 +149,228 @@ const SystemCapabilities = switch (builtin.os.tag) {
             }
         }).pipe;
     },
+    .uefi => struct {
+        const Self = @This();
+        pub const Sigaction = struct {}; // No signal handling on UEFI :)
+        pub const termios = struct {}; // FIXME: Implement?
+        pub const V = enum {
+            EOF,
+            ERASE,
+            WERASE,
+            KILL,
+        };
+
+        pub const pollfd = struct {
+            fd: u32,
+            events: i16,
+            revents: i16,
+        };
+        pub const nfds_t = u32;
+
+        pub const default_operation_mode = Configuration.OperationMode.NonInteractive;
+
+        const WriterContext = struct {
+            console_out: *std.os.uefi.protocol.SimpleTextOutput,
+            attribute: usize,
+        };
+
+        const ReaderContext = struct {
+            console_in: *std.os.uefi.protocol.SimpleTextInput,
+        };
+
+        const Writer = std.io.GenericWriter(
+            WriterContext,
+            error{},
+            struct {
+                fn write(context: WriterContext, bytes: []const u8) error{}!usize {
+                    _ = context.console_out.setAttribute(context.attribute);
+                    for (bytes) |c| {
+                        _ = context.console_out.outputString(@ptrCast(&[2]u16{ c, 0 }));
+                    }
+                    return bytes.len;
+                }
+            }.write,
+        );
+
+        const Reader = std.io.GenericReader(
+            ReaderContext,
+            error{},
+            struct {
+                fn read(context: ReaderContext, bytes: []u8) error{}!usize {
+                    var i: usize = 0;
+                    const writer = getStdOut().writer();
+                    var key: std.os.uefi.protocol.SimpleTextInputEx.Key.Input = undefined;
+                    var status = std.os.uefi.Status.NotReady;
+                    while (true) {
+                        status = context.console_in.readKeyStroke(&key);
+                        if (status == std.os.uefi.Status.Success) {
+                            if (key.scan_code == 0) {
+                                if (key.unicode_char == 0xd or key.unicode_char == 0xa) {
+                                    bytes[i] = '\n';
+                                    i += 1;
+                                    writer.writeAll("\r\n") catch {};
+                                    break;
+                                }
+
+                                i += std.unicode.utf8Encode(key.unicode_char, bytes[i..]) catch 0;
+                                writer.writeAll(bytes[0..i]) catch {};
+                            }
+                            break;
+                        }
+                    }
+
+                    while (i < bytes.len) {
+                        status = context.console_in.readKeyStroke(&key);
+                        if (status == std.os.uefi.Status.Success) {
+                            if (key.scan_code == 0) {
+                                if (key.unicode_char == 0xd or key.unicode_char == 0xa) {
+                                    bytes[i] = '\n';
+                                    i += 1;
+                                    writer.writeAll("\r\n") catch {};
+                                    break;
+                                }
+
+                                i += std.unicode.utf8Encode(key.unicode_char, bytes[i..]) catch 0;
+                                writer.writeAll(bytes[0..i]) catch {};
+                            }
+                        } else break;
+                    }
+                    return i;
+                }
+            }.read,
+        );
+
+        const File = struct {
+            _reader: ?Reader,
+            _writer: ?Writer,
+            handle: u0 = undefined,
+
+            pub fn reader(self: *const @This()) Reader {
+                return self._reader.?;
+            }
+
+            pub fn writer(self: *const @This()) Writer {
+                return self._writer.?;
+            }
+
+            pub fn write(self: *const @This(), bytes: []const u8) !usize {
+                return self.writer().write(bytes);
+            }
+
+            pub fn writeAll(self: *const @This(), bytes: []const u8) !void {
+                var i: usize = 0;
+                while (i < bytes.len) {
+                    const n = try self.write(bytes[i..]);
+                    if (n == 0) {
+                        break;
+                    }
+                    i += n;
+                }
+            }
+
+            pub fn read(self: *const @This(), bytes: []u8) !usize {
+                return self.reader().read(bytes);
+            }
+        };
+
+        pub fn getStdIn() File {
+            return File{
+                ._reader = Reader{
+                    .context = .{
+                        .console_in = std.os.uefi.system_table.con_in.?,
+                    },
+                },
+                ._writer = null,
+            };
+        }
+
+        pub fn getStdOut() File {
+            return File{
+                ._reader = null,
+                ._writer = Writer{
+                    .context = .{
+                        .console_out = std.os.uefi.system_table.con_out.?,
+                        .attribute = 0x7, // white
+                    },
+                },
+            };
+        }
+
+        pub fn getStdErr() File {
+            return File{
+                ._reader = null,
+                ._writer = Writer{
+                    .context = .{
+                        .console_out = std.os.uefi.system_table.con_out.?,
+                        .attribute = 0x4, // red
+                    },
+                },
+                .handle = undefined,
+            };
+        }
+
+        pub const winsize = struct {
+            col: u16,
+            row: u16,
+        };
+        const getWinsize = struct {
+            pub fn getWinsize(handle: anytype) !winsize {
+                _ = handle;
+                return winsize{ .col = 80, .row = 24 };
+            }
+        }.getWinsize;
+
+        pub fn getTermios() !Self.termios {
+            return .{};
+        }
+
+        pub fn setTermios(_: Self.termios) !void {}
+
+        pub fn clearEchoAndICanon(_: *Self.termios) void {}
+
+        pub fn getTermiosCC(_: Self.termios, cc: Self.V) u8 {
+            return switch (cc) {
+                // Values aren't all that important, but the source is linux.
+                .EOF => 4,
+                .ERASE => 127,
+                .WERASE => 23, // ctrl('w')
+                .KILL => 21,
+            };
+        }
+
+        pub const POLL_IN = 0;
+
+        pub fn setPollFd(p: *Self.pollfd, f: anytype) void {
+            _ = p;
+            _ = f;
+        }
+
+        pub fn poll(fds: [*]Self.pollfd, n: nfds_t, timeout: i32) c_int {
+            _ = timeout;
+            fds[n - 1].revents = Self.POLL_IN;
+            return 1;
+        }
+
+        const pipe = struct {
+            pub fn pipe() ![2]std.posix.fd_t {
+                return [2]std.posix.fd_t{ 0, 0 };
+            }
+        }.pipe;
+    },
     else => struct {
         const Self = @This();
         pub const Sigaction = std.posix.Sigaction;
+        pub const pollfd = std.posix.pollfd;
 
         pub const termios = std.posix.termios;
 
         pub const V = std.posix.V;
 
         pub const default_operation_mode = Configuration.OperationMode.Full;
+
+        pub const getStdIn = std.io.getStdIn;
+        pub const getStdOut = std.io.getStdOut;
+        pub const getStdErr = std.io.getStdErr;
 
         pub fn getWinsize(handle: anytype) !std.posix.winsize {
             var ws: std.posix.winsize = undefined;
@@ -187,12 +408,13 @@ const SystemCapabilities = switch (builtin.os.tag) {
 
         pub const POLL_IN = std.posix.POLL.IN;
 
-        pub fn setPollFd(p: *std.posix.pollfd, f: std.posix.fd_t) void {
+        pub fn setPollFd(p: *Self.pollfd, f: std.posix.fd_t) void {
             p.fd = f;
         }
 
         const PollReturnType = if (builtin.link_libc) c_int else usize; // AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
-        pub fn poll(fds: [*]std.posix.pollfd, n: std.posix.nfds_t, timeout: i32) PollReturnType {
+        pub const nfds_t = std.posix.nfds_t;
+        pub fn poll(fds: [*]Self.pollfd, n: Self.nfds_t, timeout: i32) PollReturnType {
             return std.posix.system.poll(fds, n, timeout);
         }
 
@@ -667,7 +889,7 @@ fn vtMoveRelative(row: i64, col: i64) !void {
         c = -col;
     }
 
-    var writer = std.io.getStdErr().writer();
+    var writer = SystemCapabilities.getStdErr().writer();
     if (row > 0) {
         try writer.print("\x1b[{d}{c}", .{ r, x_op });
     }
@@ -885,7 +1107,7 @@ pub const Editor = struct {
     configuration: Configuration,
     event_loop: Loop,
 
-    const Loop = if (builtin.os.tag == .wasi)
+    const Loop = if (builtin.os.tag == .wasi or builtin.os.tag == .uefi)
         struct {
             pub fn init(allocator: Allocator, configuration: Configuration) Loop {
                 _ = configuration;
@@ -1035,18 +1257,18 @@ pub const Editor = struct {
             fn controlThreadMain(self: *Loop) void {
                 defer self.control_thread_exited = true;
 
-                const stdin = std.io.getStdIn();
+                const stdin = SystemCapabilities.getStdIn();
 
                 std.debug.assert(self.thread_kill_pipe != null);
 
-                var pollfds = [_]std.posix.pollfd{ undefined, undefined, undefined };
+                var pollfds = [_]SystemCapabilities.pollfd{ undefined, undefined, undefined };
                 SystemCapabilities.setPollFd(&pollfds[0], stdin.handle);
                 SystemCapabilities.setPollFd(&pollfds[1], self.thread_kill_pipe.?.read);
                 pollfds[0].events = SystemCapabilities.POLL_IN;
                 pollfds[1].events = SystemCapabilities.POLL_IN;
                 pollfds[2].events = 0;
 
-                var nfds: std.posix.nfds_t = 2;
+                var nfds: SystemCapabilities.nfds_t = 2;
 
                 if (self.enable_signal_handling) {
                     SystemCapabilities.setPollFd(&pollfds[2], signalHandlingData.?.pipe.read);
@@ -1306,12 +1528,12 @@ pub const Editor = struct {
     }
 
     fn getLineNonInteractive(self: *Self, prompt: []const u8) ![]const u8 {
-        _ = try std.io.getStdErr().write(prompt);
+        _ = try SystemCapabilities.getStdErr().write(prompt);
 
         var array = ArrayList(u8).init(self.allocator);
         defer array.deinit();
 
-        streamUntilEol(std.io.getStdIn().reader(), array.container.writer()) catch |e| switch (e) {
+        streamUntilEol(SystemCapabilities.getStdIn().reader(), array.container.writer()) catch |e| switch (e) {
             error.EndOfStream => return error.Eof,
             else => return e,
         };
@@ -1380,7 +1602,7 @@ pub const Editor = struct {
             const old_lines = self.num_lines;
             self.getTerminalSize();
 
-            var stderr = std.io.getStdErr();
+            var stderr = SystemCapabilities.getStdErr();
 
             if (self.configuration.enable_bracketed_paste) {
                 try stderr.writeAll("\x1b[?2004h");
@@ -1503,14 +1725,14 @@ pub const Editor = struct {
             return false;
         }
 
-        _ = std.io.getStdErr().write("^C") catch 0;
+        _ = SystemCapabilities.getStdErr().write("^C") catch 0;
 
         self.buffer.container.clearAndFree();
         self.chars_touched_in_the_middle = 0;
         self.cursor = 0;
 
         {
-            var stream = std.io.bufferedWriter(std.io.getStdErr().writer());
+            var stream = std.io.bufferedWriter(SystemCapabilities.getStdErr().writer());
             try self.repositionCursor(&stream, true);
             // FIXME: Suggestion display cleanup.
             _ = try stream.write("\n");
@@ -1700,7 +1922,7 @@ pub const Editor = struct {
 
     pub fn clearLine(self: *Self) void {
         _ = self;
-        _ = std.io.getStdErr().write("\r\x1b[K") catch unreachable;
+        _ = SystemCapabilities.getStdErr().write("\r\x1b[K") catch unreachable;
     }
 
     pub fn insertString(self: *Self, string: []const u8) void {
@@ -1900,7 +2122,7 @@ pub const Editor = struct {
 
         var keybuf = [_]u8{0} ** 32;
 
-        var stdin = std.io.getStdIn();
+        var stdin = SystemCapabilities.getStdIn();
 
         if (self.incomplete_data.container.items.len == 0) {
             const nread = stdin.read(&keybuf) catch |err| {
@@ -2230,7 +2452,7 @@ pub const Editor = struct {
         self.setOriginValues(self.origin_row, 1);
 
         {
-            var stream = std.io.bufferedWriter(std.io.getStdErr().writer());
+            var stream = std.io.bufferedWriter(SystemCapabilities.getStdErr().writer());
 
             try self.repositionCursor(&stream, true);
             // FIXME: suggestion_display.redisplay();
@@ -2252,10 +2474,10 @@ pub const Editor = struct {
     fn vtDSR(self: *Self) ![2]usize {
         var buf = [_]u8{0} ** 32;
         var more_junk_to_read = false;
-        var stdin = std.io.getStdIn();
-        var pollfds = [1]std.posix.pollfd{undefined};
+        var stdin = SystemCapabilities.getStdIn();
+        var pollfds = [1]SystemCapabilities.pollfd{undefined};
         {
-            var pollfd: std.posix.pollfd = undefined;
+            var pollfd: SystemCapabilities.pollfd = undefined;
             SystemCapabilities.setPollFd(&pollfd, stdin.handle);
             pollfd.events = SystemCapabilities.POLL_IN;
             pollfd.revents = 0;
@@ -2286,7 +2508,7 @@ pub const Editor = struct {
             return fromWrapped(err);
         }
 
-        var stderr = std.io.getStdErr();
+        var stderr = SystemCapabilities.getStdErr();
         _ = try stderr.write("\x1b[6n");
 
         var state: enum {
@@ -2461,7 +2683,7 @@ pub const Editor = struct {
             }
 
             if (!found) {
-                _ = std.io.getStdErr().write("\x07") catch 0;
+                _ = SystemCapabilities.getStdErr().write("\x07") catch 0;
             }
         }
 
@@ -2524,7 +2746,7 @@ pub const Editor = struct {
             return;
         }
 
-        var buffered_output = std.io.bufferedWriter(std.io.getStdErr().writer());
+        var buffered_output = std.io.bufferedWriter(SystemCapabilities.getStdErr().writer());
         defer {
             self.shown_lines = self.currentPromptMetrics().linesWithAddition(self.cached_buffer_metrics, self.num_columns);
             _ = buffered_output.flush() catch {};
@@ -2716,7 +2938,7 @@ pub const Editor = struct {
             self.extra_forward_lines = @max(shown_lines - new_lines, self.extra_forward_lines);
         }
 
-        var stderr = std.io.getStdErr();
+        var stderr = SystemCapabilities.getStdErr();
         try self.repositionCursor(&stderr, true);
         const current_line = self.numLines();
         try self.vtClearLines(current_line, self.extra_forward_lines, &stderr);
@@ -2730,7 +2952,7 @@ pub const Editor = struct {
 
     fn reallyQuitEventLoop(self: *Self) !void {
         self.finished = false;
-        var stderr = std.io.getStdErr();
+        var stderr = SystemCapabilities.getStdErr();
         var stream = stderr.writer();
         try self.repositionCursor(&stderr, true);
         _ = try stream.write("\n");
@@ -2754,7 +2976,7 @@ pub const Editor = struct {
         try setTermios(self.default_termios);
         self.initialized = false;
         if (self.configuration.enable_bracketed_paste) {
-            var stderr = std.io.getStdErr();
+            var stderr = SystemCapabilities.getStdErr();
             try stderr.writeAll("\x1b[?2004l");
         }
     }
@@ -2860,7 +3082,7 @@ pub const Editor = struct {
         self.num_columns = 80;
         self.num_lines = 24;
         if (!is_windows) {
-            const ws = SystemCapabilities.getWinsize(std.io.getStdIn().handle) catch {
+            const ws = SystemCapabilities.getWinsize(SystemCapabilities.getStdIn().handle) catch {
                 return;
             };
             self.num_columns = ws.col;
@@ -2883,7 +3105,7 @@ pub const Editor = struct {
     }
 
     pub fn clearScreen(self: *Self) bool {
-        var stderr = std.io.getStdErr();
+        var stderr = SystemCapabilities.getStdErr();
         _ = stderr.write("\x1b[3J\x1b[H\x1b[2J") catch 0;
 
         self.vtMoveAbsolute(1, 1, &stderr) catch {};
@@ -2899,7 +3121,7 @@ pub const Editor = struct {
         }
 
         if (self.cursor == 0) {
-            _ = std.io.getStdErr().write("\x07") catch 0; // \a BEL
+            _ = SystemCapabilities.getStdErr().write("\x07") catch 0; // \a BEL
             return false;
         }
 
@@ -2916,7 +3138,7 @@ pub const Editor = struct {
         }
 
         if (self.cursor == self.buffer.size()) {
-            _ = std.io.getStdErr().write("\x07") catch 0; // \a BEL
+            _ = SystemCapabilities.getStdErr().write("\x07") catch 0; // \a BEL
             return false;
         }
 
@@ -3015,7 +3237,7 @@ pub const Editor = struct {
         self.prohibitInput();
         defer self.allowInput();
 
-        _ = std.io.getStdErr().write("<EOF>\n") catch 0;
+        _ = SystemCapabilities.getStdErr().write("<EOF>\n") catch 0;
         if (!self.always_refresh) {
             self.input_error = toWrapped(Error, error.Eof);
             _ = self.finish();
