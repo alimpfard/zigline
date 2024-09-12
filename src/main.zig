@@ -2365,7 +2365,7 @@ pub const Editor = struct {
                         continue;
                     }
 
-                    if (self.on.paste) |*_| {
+                    if (self.on.paste) |_| {
                         try self.paste_buffer.container.append(code_point);
                     } else {
                         self.insertCodePoint(code_point);
