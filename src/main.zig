@@ -978,20 +978,20 @@ pub const Editor = struct {
             while (start_it.next()) |start| {
                 var inner_it = start.value_ptr.container.iterator();
                 var hm = AutoHashMap(usize, Style).init(self.starting.container.allocator);
-                try other.starting.container.put(start.key_ptr.*, hm);
                 while (inner_it.next()) |inner| {
                     try hm.container.put(inner.key_ptr.*, inner.value_ptr.*);
                 }
+                try other.starting.container.put(start.key_ptr.*, hm);
             }
 
             var end_it = self.ending.container.iterator();
             while (end_it.next()) |end| {
                 var inner_it = end.value_ptr.container.iterator();
                 var hm = AutoHashMap(usize, Style).init(self.ending.container.allocator);
-                try other.ending.container.put(end.key_ptr.*, hm);
                 while (inner_it.next()) |inner| {
                     try hm.container.put(inner.key_ptr.*, inner.value_ptr.*);
                 }
+                try other.ending.container.put(end.key_ptr.*, hm);
             }
 
             return other;
