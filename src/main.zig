@@ -1097,6 +1097,7 @@ pub const Editor = struct {
     input_state: InputState = .Free,
     previous_free_state: InputState = .Free,
     current_spans: DrawnSpans,
+    drawn_spans: ?DrawnSpans = null,
     paste_buffer: ArrayList(u32),
     initialized: bool = false,
     refresh_needed: bool = false,
@@ -1430,6 +1431,9 @@ pub const Editor = struct {
         self.cached_buffer_metrics.deinit();
         self.cached_prompt_metrics.deinit();
         self.event_loop.deinit();
+        if (self.drawn_spans) |*spans| {
+            spans.deinit();
+        }
     }
 
     pub fn reFetchDefaultTermios(self: *Self) !void {
@@ -1484,6 +1488,37 @@ pub const Editor = struct {
         }
     }
 
+    fn addingStyleWouldDamageDrawnSpans(self: *Self, start: usize, end: usize) bool {
+        if (self.drawn_spans == null) {
+            return false;
+        }
+
+        var spans_starting = self.drawn_spans.?.starting.container;
+        var spans_ending = self.drawn_spans.?.ending.container;
+
+        var startIt = spans_starting.iterator();
+        while (startIt.next()) |starting| {
+            var innerIt = starting.value_ptr.container.iterator();
+            while (innerIt.next()) |inner| {
+                if (inner.key_ptr.* >= start and inner.key_ptr.* <= end) {
+                    return true;
+                }
+            }
+        }
+
+        var endIt = spans_ending.iterator();
+        while (endIt.next()) |ending| {
+            var innerIt = ending.value_ptr.container.iterator();
+            while (innerIt.next()) |inner| {
+                if (inner.key_ptr.* >= start and inner.key_ptr.* <= end) {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
     pub fn stylize(self: *Self, span: Span, style: Style) !void {
         if (span.isEmpty()) {
             return;
@@ -1507,17 +1542,6 @@ pub const Editor = struct {
             starting_map.* = AutoHashMap(usize, Style).init(self.allocator);
         }
 
-        var maxKnownEnd: usize = 0;
-        var startIt = starting_map.container.keyIterator();
-        while (startIt.next()) |kp| {
-            const key = kp.*;
-            if (key > maxKnownEnd) {
-                maxKnownEnd = key;
-            }
-        }
-        if (!starting_map.container.contains(end) and maxKnownEnd > end) {
-            self.refresh_needed = true;
-        }
         try starting_map.container.put(end, style);
 
         put_result = try spans_ending.getOrPut(end);
@@ -1526,22 +1550,11 @@ pub const Editor = struct {
             ending_map.* = AutoHashMap(usize, Style).init(self.allocator);
         }
 
-        var minKnownStart: usize = std.math.maxInt(usize);
-        var maxKnownStart: usize = 0;
-        var endIt = ending_map.container.keyIterator();
-        while (endIt.next()) |kp| {
-            const key = kp.*;
-            if (key < minKnownStart) {
-                minKnownStart = key;
-            }
-            if (key > maxKnownStart) {
-                maxKnownStart = key;
-            }
-        }
-        if (!ending_map.container.contains(start) and (minKnownStart < start or maxKnownStart > start)) {
+        try ending_map.container.put(start, style);
+
+        if (self.addingStyleWouldDamageDrawnSpans(start, end)) {
             self.refresh_needed = true;
         }
-        try ending_map.container.put(start, style);
     }
 
     pub fn stripStyles(self: *Self) void {
@@ -2133,6 +2146,11 @@ pub const Editor = struct {
 
         try self.refreshDisplay();
 
+        if (self.drawn_spans) |*spans| {
+            spans.deinit();
+        }
+        self.drawn_spans = try self.current_spans.deepCopy();
+
         if (self.finished) {
             try self.reallyQuitEventLoop();
         }
@@ -2679,6 +2697,10 @@ pub const Editor = struct {
         self.drawn_end_of_line_offset = 0;
         self.current_spans.deinit();
         self.current_spans = DrawnSpans.init(self.allocator);
+        if (self.drawn_spans) |*spans| {
+            spans.deinit();
+        }
+        self.drawn_spans = null;
         self.paste_buffer.container.clearAndFree();
     }
 
