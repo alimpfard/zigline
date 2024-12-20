@@ -1506,7 +1506,16 @@ pub const Editor = struct {
         if (!put_result.found_existing) {
             starting_map.* = AutoHashMap(usize, Style).init(self.allocator);
         }
-        if (!starting_map.container.contains(end)) {
+
+        var maxKnownEnd: usize = 0;
+        var startIt = starting_map.container.keyIterator();
+        while (startIt.next()) |kp| {
+            const key = kp.*;
+            if (key > maxKnownEnd) {
+                maxKnownEnd = key;
+            }
+        }
+        if (!starting_map.container.contains(end) and maxKnownEnd > end) {
             self.refresh_needed = true;
         }
         try starting_map.container.put(end, style);
@@ -1516,7 +1525,20 @@ pub const Editor = struct {
         if (!put_result.found_existing) {
             ending_map.* = AutoHashMap(usize, Style).init(self.allocator);
         }
-        if (!ending_map.container.contains(start)) {
+
+        var minKnownStart: usize = std.math.maxInt(usize);
+        var maxKnownStart: usize = 0;
+        var endIt = ending_map.container.keyIterator();
+        while (endIt.next()) |kp| {
+            const key = kp.*;
+            if (key < minKnownStart) {
+                minKnownStart = key;
+            }
+            if (key > maxKnownStart) {
+                maxKnownStart = key;
+            }
+        }
+        if (!ending_map.container.contains(start) and (minKnownStart < start or maxKnownStart > start)) {
             self.refresh_needed = true;
         }
         try ending_map.container.put(start, style);
@@ -2802,11 +2824,17 @@ pub const Editor = struct {
             cb.f(cb.context);
         }
 
+        var empty_styles = AutoHashMap(usize, Style).init(self.allocator);
+        defer empty_styles.deinit();
+
         if (self.cached_prompt_valid) {
             if (!self.refresh_needed and self.cursor == self.buffer.size()) {
                 // Just write the characters out and continue,
                 // no need to refresh anything else.
-                _ = try buffered_output.write(self.pending_chars.container.items);
+                for (self.drawn_cursor..self.buffer.size()) |i| {
+                    try self.applyStyles(&empty_styles, &buffered_output, i);
+                    try self.printCharacterAt(i, &buffered_output);
+                }
                 self.pending_chars.container.clearAndFree();
                 self.drawn_cursor = self.cursor;
                 self.drawn_end_of_line_offset = self.buffer.size();
@@ -2815,9 +2843,6 @@ pub const Editor = struct {
                 return;
             }
         }
-
-        var empty_styles = AutoHashMap(usize, Style).init(self.allocator);
-        defer empty_styles.deinit();
 
         // Ouch, reflow entire line.
         if (!has_cleaned_up) {
