@@ -2117,6 +2117,11 @@ pub const Editor = struct {
                 try writer.print("\x1b[A", .{});
             }
         }
+
+        // Go back down.
+        if (above > 0) {
+            try writer.print("\x1b[{d}B", .{above});
+        }
     }
 
     fn tryUpdateOnce(self: *Self) !void {
