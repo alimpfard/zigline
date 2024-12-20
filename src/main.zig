@@ -72,7 +72,10 @@ pub const SystemCapabilities = switch (builtin.os.tag) {
         const getWinsize = if (builtin.os.tag == .windows) struct {
             pub fn getWinsize(handle: anytype) !winsize {
                 var ws: std.posix.winsize = undefined;
-                if (std.c.ioctl(handle, std.posix.T.IOCGWINSZ, @intFromPtr(&ws)) != 0) {
+                if (std.c.ioctl(handle, std.posix.T.IOCGWINSZ, @intFromPtr(&ws)) != 0 or
+                    ws.ws_col == 0 or
+                    ws.ws_row == 0)
+                {
                     const fd = std.posix.open("/dev/tty", .{ .ACCMODE = .RDONLY }, @as(std.posix.mode_t, 0)) catch return;
                     if (fd != -1) {
                         _ = std.c.ioctl(@intCast(fd), std.posix.T.IOCGWINSZ, @intFromPtr(&ws));
@@ -375,7 +378,10 @@ pub const SystemCapabilities = switch (builtin.os.tag) {
         pub fn getWinsize(handle: anytype) !std.posix.winsize {
             var ws: std.posix.winsize = undefined;
             const ioctl = if (builtin.os.tag == .linux) std.os.linux.ioctl else std.c.ioctl;
-            if (ioctl(handle, std.posix.T.IOCGWINSZ, @intFromPtr(&ws)) != 0) {
+            if (ioctl(handle, std.posix.T.IOCGWINSZ, @intFromPtr(&ws)) != 0 or
+                ws.col == 0 or
+                ws.row == 0)
+            {
                 const fd = try std.posix.open("/dev/tty", .{ .ACCMODE = .RDONLY }, @as(std.posix.mode_t, 0));
                 if (fd != -1) {
                     _ = ioctl(@intCast(fd), std.posix.T.IOCGWINSZ, @intFromPtr(&ws));
