@@ -2840,6 +2840,7 @@ pub const Editor = struct {
                     try self.applyStyles(&empty_styles, &buffered_output, i);
                     try self.printCharacterAt(i, &buffered_output);
                 }
+                try self.vtApplyStyle(Style.resetStyle(), &buffered_output, true);
                 self.pending_chars.container.clearAndFree();
                 self.drawn_cursor = self.cursor;
                 self.drawn_end_of_line_offset = self.buffer.size();
