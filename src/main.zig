@@ -203,10 +203,10 @@ pub const SystemCapabilities = switch (builtin.os.tag) {
                     var i: usize = 0;
                     const writer = getStdOut().writer();
                     var key: std.os.uefi.protocol.SimpleTextInputEx.Key.Input = undefined;
-                    var status = std.os.uefi.Status.NotReady;
+                    var status: std.os.uefi.Status = .not_ready;
                     while (true) {
                         status = context.console_in.readKeyStroke(&key);
-                        if (status == std.os.uefi.Status.Success) {
+                        if (status == .success) {
                             if (key.scan_code == 0) {
                                 if (key.unicode_char == 0xd or key.unicode_char == 0xa) {
                                     bytes[i] = '\n';
@@ -224,7 +224,7 @@ pub const SystemCapabilities = switch (builtin.os.tag) {
 
                     while (i < bytes.len) {
                         status = context.console_in.readKeyStroke(&key);
-                        if (status == std.os.uefi.Status.Success) {
+                        if (status == .success) {
                             if (key.scan_code == 0) {
                                 if (key.unicode_char == 0xd or key.unicode_char == 0xa) {
                                     bytes[i] = '\n';
