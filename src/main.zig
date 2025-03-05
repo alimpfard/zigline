@@ -912,7 +912,7 @@ var signalHandlingData: ?struct {
     old_sigint: ?SystemCapabilities.Sigaction = null,
     old_sigwinch: ?SystemCapabilities.Sigaction = null,
 
-    pub fn handleSignal(signo: i32) callconv(.C) void {
+    pub fn handleSignal(signo: i32) callconv(.c) void {
         var f = std.fs.File{ .handle = signalHandlingData.?.pipe.write };
         f.writer().writeInt(i32, signo, .little) catch {};
     }
