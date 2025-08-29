@@ -8,6 +8,7 @@ const sane = @import("sane.zig");
 const ArrayList = sane.ArrayList;
 const AutoHashMap = sane.AutoHashMap;
 const Queue = sane.Queue;
+const StringBuilder = sane.StringBuilder;
 
 const builtin = @import("builtin");
 const is_windows = builtin.os.tag == .windows;
@@ -59,7 +60,7 @@ pub const SystemCapabilities = switch (builtin.os.tag) {
             TIME,
         };
 
-        pub const default_operation_mode = Configuration.OperationMode.NonInteractive;
+        pub const default_operation_mode: Configuration.OperationMode = .non_interactive;
 
         pub const getStdIn = std.io.getStdIn;
         pub const getStdOut = std.io.getStdOut;
@@ -84,12 +85,12 @@ pub const SystemCapabilities = switch (builtin.os.tag) {
                         return error.Invalid;
                     }
                 }
-                return winsize{ .col = ws.ws_col, .row = ws.ws_row };
+                return .{ .col = ws.ws_col, .row = ws.ws_row };
             }
         } else struct {
             pub fn getWinsize(handle: anytype) !winsize {
                 _ = handle;
-                return winsize{ .col = 80, .row = 24 };
+                return .{ .col = 80, .row = 24 };
             }
         }.getWinsize;
 
@@ -144,7 +145,7 @@ pub const SystemCapabilities = switch (builtin.os.tag) {
                 var attrs: std.os.windows.SECURITY_ATTRIBUTES = undefined;
                 attrs.nLength = 0;
                 try std.os.windows.CreatePipe(&rd, &wr, &attrs);
-                return [2]std.posix.fd_t{ @ptrCast(rd), @ptrCast(wr) };
+                return .{ @ptrCast(rd), @ptrCast(wr) };
             }
         } else struct {
             pub fn pipe() ![2]std.posix.fd_t {
@@ -277,8 +278,8 @@ pub const SystemCapabilities = switch (builtin.os.tag) {
         };
 
         pub fn getStdIn() File {
-            return File{
-                ._reader = Reader{
+            return .{
+                ._reader = .{
                     .context = .{
                         .console_in = std.os.uefi.system_table.con_in.?,
                     },
@@ -288,9 +289,9 @@ pub const SystemCapabilities = switch (builtin.os.tag) {
         }
 
         pub fn getStdOut() File {
-            return File{
+            return .{
                 ._reader = null,
-                ._writer = Writer{
+                ._writer = .{
                     .context = .{
                         .console_out = std.os.uefi.system_table.con_out.?,
                         .attribute = 0x7, // white
@@ -300,9 +301,9 @@ pub const SystemCapabilities = switch (builtin.os.tag) {
         }
 
         pub fn getStdErr() File {
-            return File{
+            return .{
                 ._reader = null,
-                ._writer = Writer{
+                ._writer = .{
                     .context = .{
                         .console_out = std.os.uefi.system_table.con_out.?,
                         .attribute = 0x4, // red
@@ -319,7 +320,7 @@ pub const SystemCapabilities = switch (builtin.os.tag) {
         const getWinsize = struct {
             pub fn getWinsize(handle: anytype) !winsize {
                 _ = handle;
-                return winsize{ .col = 80, .row = 24 };
+                return .{ .col = 80, .row = 24 };
             }
         }.getWinsize;
 
@@ -356,7 +357,7 @@ pub const SystemCapabilities = switch (builtin.os.tag) {
 
         const pipe = struct {
             pub fn pipe() ![2]std.posix.fd_t {
-                return [2]std.posix.fd_t{ 0, 0 };
+                return .{ 0, 0 };
             }
         }.pipe;
     },
@@ -369,7 +370,7 @@ pub const SystemCapabilities = switch (builtin.os.tag) {
 
         pub const V = std.posix.V;
 
-        pub const default_operation_mode = Configuration.OperationMode.Full;
+        pub const default_operation_mode: Configuration.OperationMode = .full;
 
         pub const getStdIn = std.io.getStdIn;
         pub const getStdOut = std.io.getStdOut;
@@ -500,23 +501,28 @@ pub const Style = struct {
     underline: bool = false,
     bold: bool = false,
     italic: bool = false,
-    background: Color = Color{ .xterm = XtermColor.Unchanged },
-    foreground: Color = Color{ .xterm = XtermColor.Unchanged },
+    background: Color = .{ .xterm = .unchanged },
+    foreground: Color = .{ .xterm = .unchanged },
     // FIXME: Masks + Hyperlinks
 
     const Self = @This();
 
+    pub const reset: Style = .{
+        .background = .{ .xterm = .default },
+        .foreground = .{ .xterm = .default },
+    };
+
     pub const XtermColor = enum(i32) {
-        Default = 9,
-        Black = 0,
-        Red,
-        Green,
-        Yellow,
-        Blue,
-        Magenta,
-        Cyan,
-        White,
-        Unchanged,
+        default = 9,
+        black = 0,
+        red,
+        green,
+        yellow,
+        blue,
+        magenta,
+        cyan,
+        white,
+        unchanged,
     };
 
     pub const Color = union(enum) {
@@ -525,40 +531,33 @@ pub const Style = struct {
 
         pub fn isDefault(self: @This()) bool {
             return switch (self) {
-                .xterm => self.xterm == XtermColor.Unchanged,
-                .rgb => self.rgb[0] == 0 and self.rgb[1] == 0 and self.rgb[2] == 0,
+                .xterm => |xterm| xterm == .unchanged,
+                .rgb => |rgb| rgb[0] == 0 and rgb[1] == 0 and rgb[2] == 0,
             };
         }
 
         pub fn toVTEscape(self: @This(), allocator: Allocator, role: enum { background, foreground }) ![]const u8 {
             switch (self) {
-                .xterm => {
-                    if (self.xterm == XtermColor.Unchanged) {
+                .xterm => |xterm| {
+                    if (xterm == .unchanged) {
                         return "";
                     }
                     return try std.fmt.allocPrint(
                         allocator,
                         "\x1b[{d}m",
-                        .{@intFromEnum(self.xterm) + @as(u8, if (role == .background) 40 else 30)},
+                        .{@intFromEnum(xterm) + @as(u8, if (role == .background) 40 else 30)},
                     );
                 },
-                .rgb => {
+                .rgb => |rgb| {
                     return try std.fmt.allocPrint(
                         allocator,
                         "\x1b[{};2;{d};{d};{d}m",
-                        .{ @as(u8, if (role == .background) 48 else 38), self.rgb[0], self.rgb[1], self.rgb[2] },
+                        .{ @as(u8, if (role == .background) 48 else 38), rgb[0], rgb[1], rgb[2] },
                     );
                 },
             }
         }
     };
-
-    pub fn resetStyle() Self {
-        return .{
-            .background = Color{ .xterm = XtermColor.Default },
-            .foreground = Color{ .xterm = XtermColor.Default },
-        };
-    }
 
     pub fn unifiedWith(self: Self, other: Self, prefer_other: bool) Self {
         var style = self;
@@ -590,14 +589,14 @@ pub const Style = struct {
 };
 pub const Span = struct {
     const Mode = enum {
-        ByteOriented,
-        CodePointOriented,
+        byte_oriented,
+        code_point_oriented,
     };
     const Self = @This();
 
     begin: usize,
     end: usize,
-    mode: Mode = .CodePointOriented,
+    mode: Mode = .code_point_oriented,
 
     pub fn isEmpty(self: Self) bool {
         return self.begin >= self.end;
@@ -621,7 +620,7 @@ pub const StringMetrics = struct {
 
     pub fn init(allocator: Allocator) Self {
         return .{
-            .line_metrics = ArrayList(LineMetrics).init(allocator),
+            .line_metrics = .init(allocator),
         };
     }
 
@@ -671,24 +670,24 @@ pub const StringMetrics = struct {
         self.line_metrics.container.clearAndFree();
         self.total_length = 0;
         self.max_line_length = 0;
-        try self.line_metrics.container.append(LineMetrics{});
+        try self.line_metrics.container.append(.{});
     }
 };
 
 pub const SuggestionDisplay = struct {};
 pub const SuggestionManager = struct {};
 pub const CSIMod = enum(u8) {
-    None = 0,
-    Shift = 1,
-    Alt = 2,
-    Ctrl = 4,
+    none = 0,
+    shift = 1,
+    alt = 2,
+    ctrl = 4,
 };
 pub const Key = struct {
     code_point: u32,
     modifiers: enum(u8) {
-        None = 0,
-        Alt = 1,
-    } = .None,
+        none = 0,
+        alt = 1,
+    } = .none,
 
     const Self = @This();
 
@@ -704,8 +703,8 @@ const KeyCallbackEntry = struct {
     const Self = @This();
 
     pub fn init(allocator: Allocator, sequence: []const Key, f: *const fn (*Editor) bool) Self {
-        var self = Self{
-            .sequence = ArrayList(Key).init(allocator),
+        var self: Self = .{
+            .sequence = .init(allocator),
             .callback = f,
         };
         self.sequence.container.appendSlice(sequence) catch unreachable;
@@ -727,8 +726,8 @@ pub const KeyCallbackMachine = struct {
 
     pub fn init(allocator: Allocator) Self {
         return .{
-            .key_callbacks = ArrayList(KeyCallbackEntry).init(allocator),
-            .current_matching_keys = ArrayList([]const Key).init(allocator),
+            .key_callbacks = .init(allocator),
+            .current_matching_keys = .init(allocator),
         };
     }
 
@@ -754,7 +753,7 @@ pub const KeyCallbackMachine = struct {
         }
 
         self.sequence_length += 1;
-        var old_matching_keys = ArrayList([]const Key).init(editor.allocator);
+        var old_matching_keys: ArrayList([]const Key) = .init(editor.allocator);
         std.mem.swap(@TypeOf(old_matching_keys), &old_matching_keys, &self.current_matching_keys);
         defer old_matching_keys.deinit();
 
@@ -811,7 +810,7 @@ pub const KeyCallbackMachine = struct {
     }
 
     pub fn registerKeyInputCallback(self: *Self, sequence: []const Key, c: *const fn (*Editor) bool) !void {
-        const inserted_entry = KeyCallbackEntry.init(self.key_callbacks.container.allocator, sequence, c);
+        const inserted_entry: KeyCallbackEntry = .init(self.key_callbacks.container.allocator, sequence, c);
 
         for (self.key_callbacks.container.items, 0..self.key_callbacks.size()) |entry, j| {
             if (entry.sequence.container.items.len == sequence.len) {
@@ -838,38 +837,37 @@ pub const KeyCallbackMachine = struct {
     }
 };
 pub const HistoryEntry = struct {
-    entry: ArrayList(u8),
+    allocator: Allocator,
+    entry: []const u8,
     timestamp: i64,
 
     const Self = @This();
 
     pub fn init(allocator: Allocator, entry: []const u8) !Self {
-        var self = Self{
-            .entry = ArrayList(u8).init(allocator),
+        return .{
+            .allocator = allocator,
+            .entry = try allocator.dupe(u8, entry),
             .timestamp = std.time.timestamp(),
         };
-        try self.entry.container.appendSlice(entry);
-        return self;
     }
 
     pub fn initWithTimestamp(allocator: Allocator, entry: []const u8, timestamp: i64) !Self {
-        var self = Self{
-            .entry = ArrayList(u8).init(allocator),
+        return .{
+            .allocator = allocator,
+            .entry = try allocator.dupe(u8, entry),
             .timestamp = timestamp,
         };
-        try self.entry.container.appendSlice(entry);
-        return self;
     }
 
     pub fn deinit(self: *Self) void {
-        self.entry.deinit();
+        self.allocator.free(self.entry);
     }
 };
 pub const Configuration = struct {
     pub const OperationMode = enum {
-        Full,
-        NoEscapeSequences,
-        NonInteractive,
+        full,
+        no_escape_sequences,
+        non_interactive,
     };
 
     enable_bracketed_paste: bool = true,
@@ -913,7 +911,7 @@ var signalHandlingData: ?struct {
     old_sigwinch: ?SystemCapabilities.Sigaction = null,
 
     pub fn handleSignal(signo: i32) callconv(.c) void {
-        var f = std.fs.File{ .handle = signalHandlingData.?.pipe.write };
+        var f: std.fs.File = .{ .handle = signalHandlingData.?.pipe.write };
         f.writer().writeInt(i32, signo, .little) catch {};
     }
 } = null;
@@ -940,20 +938,20 @@ pub const Editor = struct {
 
     const Self = @This();
     const InputState = enum {
-        Free,
-        Verbatim,
-        Paste,
-        GotEscape,
-        CSIExpectParameter,
-        CSIExpectIntermediate,
-        CSIExpectFinal,
+        free,
+        verbatim,
+        paste,
+        got_escape,
+        csi_expect_parameter,
+        csi_expect_intermediate,
+        csi_expect_final,
     };
     const VTState = enum {
-        Free,
-        Escape,
-        Bracket,
-        BracketArgsSemi,
-        Title,
+        free,
+        escape,
+        bracket,
+        bracket_args_semi,
+        title,
     };
     const DrawnSpans = struct {
         starting: AutoHashMap(usize, AutoHashMap(usize, Style)),
@@ -961,8 +959,8 @@ pub const Editor = struct {
 
         pub fn init(allocator: Allocator) @This() {
             return .{
-                .starting = AutoHashMap(usize, AutoHashMap(usize, Style)).init(allocator),
-                .ending = AutoHashMap(usize, AutoHashMap(usize, Style)).init(allocator),
+                .starting = .init(allocator),
+                .ending = .init(allocator),
             };
         }
 
@@ -979,11 +977,11 @@ pub const Editor = struct {
         }
 
         pub fn deepCopy(self: *const @This()) !@This() {
-            var other = @This().init(self.starting.container.allocator);
+            var other: @This() = .init(self.starting.container.allocator);
             var start_it = self.starting.container.iterator();
             while (start_it.next()) |start| {
                 var inner_it = start.value_ptr.container.iterator();
-                var hm = AutoHashMap(usize, Style).init(self.starting.container.allocator);
+                var hm: AutoHashMap(usize, Style) = .init(self.starting.container.allocator);
                 while (inner_it.next()) |inner| {
                     try hm.container.put(inner.key_ptr.*, inner.value_ptr.*);
                 }
@@ -993,7 +991,7 @@ pub const Editor = struct {
             var end_it = self.ending.container.iterator();
             while (end_it.next()) |end| {
                 var inner_it = end.value_ptr.container.iterator();
-                var hm = AutoHashMap(usize, Style).init(self.ending.container.allocator);
+                var hm: AutoHashMap(usize, Style) = .init(self.ending.container.allocator);
                 while (inner_it.next()) |inner| {
                     try hm.container.put(inner.key_ptr.*, inner.value_ptr.*);
                 }
@@ -1004,12 +1002,12 @@ pub const Editor = struct {
         }
     };
     const LoopExitCode = enum {
-        Exit,
-        Retry,
+        exit,
+        retry,
     };
     const DeferredAction = union(enum) {
-        HandleResizeEvent: bool, // reset_origin
-        TryUpdateOnce: u8, // dummy
+        handle_resize_event: bool, // reset_origin
+        try_update_once: u8, // dummy
     };
     const Callback = struct {
         f: *const fn (*anyopaque) void,
@@ -1018,8 +1016,8 @@ pub const Editor = struct {
         pub fn makeHandler(comptime T: type, comptime InnerT: type, comptime name: []const u8) type {
             return struct {
                 pub fn theHandler(context: *anyopaque) void {
-                    const ctx: T = @alignCast(@ptrCast(context));
-                    @call(.auto, @field(InnerT, name), .{ctx});
+                    const ctx: T = @ptrCast(@alignCast(context));
+                    @field(InnerT, name)(ctx);
                 }
             };
         }
@@ -1032,8 +1030,8 @@ pub const Editor = struct {
             pub fn makeHandler(comptime U: type, comptime InnerT: type, comptime name: []const u8) type {
                 return struct {
                     pub fn theHandler(context: *anyopaque, value: T) void {
-                        const ctx: U = @alignCast(@ptrCast(context));
-                        @call(.auto, @field(InnerT, name), .{ ctx, value });
+                        const ctx: U = @ptrCast(@alignCast(context));
+                        @field(InnerT, name)(ctx, value);
                     }
                 };
             }
@@ -1053,10 +1051,10 @@ pub const Editor = struct {
     reset_buffer_on_search_end: bool = false,
     search_offset: usize = 0,
     search_offset_state: enum {
-        Unbiased,
-        Backwards,
-        Forwards,
-    } = .Unbiased,
+        unbiased,
+        backwards,
+        forwards,
+    } = .unbiased,
     pre_search_cursor: usize = 0,
     pre_search_buffer: ArrayList(u32),
     pending_chars: ArrayList(u8),
@@ -1088,9 +1086,9 @@ pub const Editor = struct {
     suggestion_manager: SuggestionManager = .{},
     always_refresh: bool = false,
     tab_direction: enum {
-        Forward,
-        Backward,
-    } = .Forward,
+        forward,
+        backward,
+    } = .forward,
     callback_machine: KeyCallbackMachine,
     termios: termios = undefined,
     default_termios: termios = undefined,
@@ -1100,8 +1098,8 @@ pub const Editor = struct {
     history_cursor: usize = 0,
     history_capacity: usize = 1024,
     history_dirty: bool = false,
-    input_state: InputState = .Free,
-    previous_free_state: InputState = .Free,
+    input_state: InputState = .free,
+    previous_free_state: InputState = .free,
     current_spans: DrawnSpans,
     drawn_spans: ?DrawnSpans = null,
     paste_buffer: ArrayList(u32),
@@ -1142,7 +1140,7 @@ pub const Editor = struct {
 
             pub fn process(self: *Loop) !Process {
                 _ = self;
-                return Process{};
+                return .{};
             }
 
             pub fn loopAction(self: *Loop, code: LoopExitCode) !void {
@@ -1166,7 +1164,7 @@ pub const Editor = struct {
             pub fn handle(self: *Loop, handlers: anytype) !HandleResult {
                 _ = self;
                 _ = handlers;
-                return HandleResult{ .e = null };
+                return .{ .e = null };
             }
         }
     else
@@ -1190,9 +1188,9 @@ pub const Editor = struct {
             pub fn init(allocator: Allocator, configuration: Configuration) Loop {
                 return .{
                     .enable_signal_handling = configuration.enable_signal_handling,
-                    .loop_queue = Queue(LoopExitCode).init(allocator),
-                    .deferred_action_queue = Queue(DeferredAction).init(allocator),
-                    .signal_queue = Queue(Signal).init(allocator),
+                    .loop_queue = .init(allocator),
+                    .deferred_action_queue = .init(allocator),
+                    .signal_queue = .init(allocator),
                 };
             }
 
@@ -1249,7 +1247,7 @@ pub const Editor = struct {
                     };
                 }
 
-                return Process{ .loop = self };
+                return .{ .loop = self };
             }
 
             pub fn loopAction(self: *Loop, code: LoopExitCode) !void {
@@ -1268,7 +1266,7 @@ pub const Editor = struct {
 
                 std.debug.assert(self.thread_kill_pipe != null);
 
-                var pollfds = [_]SystemCapabilities.pollfd{ undefined, undefined, undefined };
+                var pollfds: [3]SystemCapabilities.pollfd = @splat(undefined);
                 SystemCapabilities.setPollFd(&pollfds[0], stdin.handle);
                 SystemCapabilities.setPollFd(&pollfds[1], self.thread_kill_pipe.?.read);
                 pollfds[0].events = SystemCapabilities.POLL_IN;
@@ -1301,7 +1299,7 @@ pub const Editor = struct {
                                     unreachable;
                                 },
                             };
-                            self.loop_queue.enqueue(.Exit) catch {
+                            self.loop_queue.enqueue(.exit) catch {
                                 break;
                             };
                             self.queue_condition.broadcast();
@@ -1311,7 +1309,7 @@ pub const Editor = struct {
 
                     if (pollfds[1].revents & SystemCapabilities.POLL_IN != 0) {
                         // We're supposed to die...after draining the pipe.
-                        var buf = [_]u8{0} ** 8;
+                        var buf: [8]u8 = @splat(0);
                         _ = std.posix.read(self.thread_kill_pipe.?.read, &buf) catch 0;
                         break;
                     }
@@ -1319,7 +1317,7 @@ pub const Editor = struct {
                     if (!is_windows) {
                         if (pollfds[2].revents & SystemCapabilities.POLL_IN != 0) no_read: {
                             // A signal! Let's handle it.
-                            var f = std.fs.File{ .handle = signalHandlingData.?.pipe.read };
+                            var f: std.fs.File = .{ .handle = signalHandlingData.?.pipe.read };
                             const signo = f.reader().readInt(i32, .little) catch {
                                 break :no_read;
                             };
@@ -1343,7 +1341,7 @@ pub const Editor = struct {
                     }
 
                     if (pollfds[0].revents & SystemCapabilities.POLL_IN != 0) {
-                        self.deferred_action_queue.enqueue(DeferredAction{ .TryUpdateOnce = 0 }) catch {};
+                        self.deferred_action_queue.enqueue(.{ .try_update_once = 0 }) catch {};
                         self.logic_cond_mutex.lock();
                         defer self.logic_cond_mutex.unlock();
                         self.queue_condition.broadcast();
@@ -1367,10 +1365,10 @@ pub const Editor = struct {
                 while (!self.loop_queue.isEmpty()) {
                     const code = self.loop_queue.dequeue();
                     switch (code) {
-                        .Exit => {
+                        .exit => {
                             return error.ZiglineEventLoopExit;
                         },
-                        .Retry => {
+                        .retry => {
                             return error.ZiglineEventLoopRetry;
                         },
                     }
@@ -1399,27 +1397,25 @@ pub const Editor = struct {
         };
 
     pub fn init(allocator: Allocator, configuration: Configuration) Self {
-        const self = Self{
+        return .{
             .allocator = allocator,
-            .buffer = ArrayList(u32).init(allocator),
-            .callback_machine = KeyCallbackMachine.init(allocator),
-            .pre_search_buffer = ArrayList(u32).init(allocator),
-            .pending_chars = ArrayList(u8).init(allocator),
-            .incomplete_data = ArrayList(u8).init(allocator),
-            .returned_line = &[0]u8{},
-            .remembered_suggestion_static_data = ArrayList(u32).init(allocator),
-            .history = ArrayList(HistoryEntry).init(allocator),
-            .current_spans = DrawnSpans.init(allocator),
-            .new_prompt = ArrayList(u8).init(allocator),
-            .paste_buffer = ArrayList(u32).init(allocator),
+            .buffer = .init(allocator),
+            .callback_machine = .init(allocator),
+            .pre_search_buffer = .init(allocator),
+            .pending_chars = .init(allocator),
+            .incomplete_data = .init(allocator),
+            .returned_line = &.{},
+            .remembered_suggestion_static_data = .init(allocator),
+            .history = .init(allocator),
+            .current_spans = .init(allocator),
+            .new_prompt = .init(allocator),
+            .paste_buffer = .init(allocator),
             .configuration = configuration,
-            .cached_prompt_metrics = StringMetrics.init(allocator),
-            .old_prompt_metrics = StringMetrics.init(allocator),
-            .cached_buffer_metrics = StringMetrics.init(allocator),
-            .event_loop = Loop.init(allocator, configuration),
+            .cached_prompt_metrics = .init(allocator),
+            .old_prompt_metrics = .init(allocator),
+            .cached_buffer_metrics = .init(allocator),
+            .event_loop = .init(allocator, configuration),
         };
-
-        return self;
     }
 
     pub fn deinit(self: *Self) void {
@@ -1452,7 +1448,7 @@ pub const Editor = struct {
     }
 
     pub fn addToHistory(self: *Self, line: []const u8) !void {
-        const entry = try HistoryEntry.init(self.allocator, line);
+        const entry: HistoryEntry = try .init(self.allocator, line);
         try self.history.container.append(entry);
     }
 
@@ -1490,7 +1486,7 @@ pub const Editor = struct {
         defer history_file.close();
         var writer = history_file.writer();
         for (self.history.container.items) |entry| {
-            try writer.print("{}::{s}\n\n", .{ entry.timestamp, entry.entry.container.items });
+            try writer.print("{}::{s}\n\n", .{ entry.timestamp, entry.entry });
         }
     }
 
@@ -1533,7 +1529,7 @@ pub const Editor = struct {
         var start = span.begin;
         var end = span.end;
 
-        if (span.mode == .ByteOriented) {
+        if (span.mode == .byte_oriented) {
             const offsets = self.byteOffsetRangeToCodePointOffsetRange(span.begin, span.end, 0, false);
             start = offsets.start;
             end = offsets.end;
@@ -1545,7 +1541,7 @@ pub const Editor = struct {
         var put_result = try spans_starting.getOrPut(start);
         var starting_map = put_result.value_ptr;
         if (!put_result.found_existing) {
-            starting_map.* = AutoHashMap(usize, Style).init(self.allocator);
+            starting_map.* = .init(self.allocator);
         }
 
         try starting_map.container.put(end, style);
@@ -1553,7 +1549,7 @@ pub const Editor = struct {
         put_result = try spans_ending.getOrPut(end);
         var ending_map = put_result.value_ptr;
         if (!put_result.found_existing) {
-            ending_map.* = AutoHashMap(usize, Style).init(self.allocator);
+            ending_map.* = .init(self.allocator);
         }
 
         try ending_map.container.put(start, style);
@@ -1565,13 +1561,13 @@ pub const Editor = struct {
 
     pub fn stripStyles(self: *Self) void {
         self.current_spans.deinit();
-        self.current_spans = DrawnSpans.init(self.allocator);
+        self.current_spans = .init(self.allocator);
     }
 
     fn getLineNonInteractive(self: *Self, prompt: []const u8) ![]const u8 {
         _ = try SystemCapabilities.getStdErr().write(prompt);
 
-        var array = ArrayList(u8).init(self.allocator);
+        var array: ArrayList(u8) = .init(self.allocator);
         defer array.deinit();
 
         streamUntilEol(SystemCapabilities.getStdIn().reader(), array.container.writer()) catch |e| switch (e) {
@@ -1600,7 +1596,7 @@ pub const Editor = struct {
     }
 
     pub fn getLine(self: *Self, prompt: []const u8) ![]const u8 {
-        if (self.configuration.operation_mode == .NonInteractive) {
+        if (self.configuration.operation_mode == .non_interactive) {
             // Disable all the fancy stuff, use a plain read.
             return self.getLineNonInteractive(prompt);
         }
@@ -1623,12 +1619,12 @@ pub const Editor = struct {
                     signalHandlingData.?.old_sigwinch = @as(SystemCapabilities.Sigaction, undefined);
                     std.posix.sigaction(
                         std.posix.SIG.INT,
-                        &SystemCapabilities.Sigaction{ .handler = .{ .handler = @TypeOf(signalHandlingData.?).handleSignal }, .mask = std.posix.empty_sigset, .flags = 0 },
+                        &.{ .handler = .{ .handler = @TypeOf(signalHandlingData.?).handleSignal }, .mask = std.posix.empty_sigset, .flags = 0 },
                         &signalHandlingData.?.old_sigint.?,
                     );
                     std.posix.sigaction(
                         std.posix.SIG.WINCH,
-                        &SystemCapabilities.Sigaction{ .handler = .{ .handler = @TypeOf(signalHandlingData.?).handleSignal }, .mask = std.posix.empty_sigset, .flags = 0 },
+                        &.{ .handler = .{ .handler = @TypeOf(signalHandlingData.?).handleSignal }, .mask = std.posix.empty_sigset, .flags = 0 },
                         &signalHandlingData.?.old_sigwinch.?,
                     );
                 }
@@ -1673,7 +1669,7 @@ pub const Editor = struct {
 
             var had_incomplete_data_at_start = false;
             if (self.incomplete_data.container.items.len != 0) {
-                try self.event_loop.deferredInvoke(.{ .TryUpdateOnce = 0 });
+                try self.event_loop.deferredInvoke(.{ .try_update_once = 0 });
                 had_incomplete_data_at_start = true;
             }
 
@@ -1685,7 +1681,7 @@ pub const Editor = struct {
                 }
                 had_incomplete_data_at_start = false;
 
-                const result = self.event_loop.handle(.{
+                const result: Loop.HandleResult = self.event_loop.handle(.{
                     .signal = struct {
                         editor: *Self,
 
@@ -1702,20 +1698,20 @@ pub const Editor = struct {
                         editor: *Self,
                         pub fn handleEvent(s: @This(), action: DeferredAction) !void {
                             switch (action) {
-                                .HandleResizeEvent => {
-                                    try s.editor.handleResizeEvent(action.HandleResizeEvent);
+                                .handle_resize_event => |handle_resize_event| {
+                                    try s.editor.handleResizeEvent(handle_resize_event);
                                 },
-                                .TryUpdateOnce => {
+                                .try_update_once => {
                                     try s.editor.tryUpdateOnce();
                                 },
                             }
                         }
                     }{ .editor = self },
                 }) catch |e| switch (e) {
-                    error.ZiglineEventLoopExit, error.ZiglineEventLoopRetry => Self.Loop.HandleResult{ .e = toWrapped(Self.Loop.HandleResult.Error, e) },
+                    error.ZiglineEventLoopExit, error.ZiglineEventLoopRetry => .{ .e = toWrapped(Loop.HandleResult.Error, e) },
                     else => b: {
                         self.input_error = toWrapped(Error, e);
-                        break :b Self.Loop.HandleResult{ .e = null };
+                        break :b .{ .e = null };
                     },
                 };
 
@@ -1747,7 +1743,7 @@ pub const Editor = struct {
 
         self.getTerminalSize();
 
-        if (self.configuration.operation_mode == .Full) {
+        if (self.configuration.operation_mode == .full) {
             clearEchoAndICanon(&t);
         }
 
@@ -1786,7 +1782,7 @@ pub const Editor = struct {
         self.chars_touched_in_the_middle = 0;
         self.is_editing = false;
         try self.restore();
-        try self.event_loop.loopAction(.Retry);
+        try self.event_loop.loopAction(.retry);
 
         return false;
     }
@@ -1801,7 +1797,7 @@ pub const Editor = struct {
             if (self.setOrigin(false)) {
                 try self.handleResizeEvent(false);
             } else {
-                try self.event_loop.deferredInvoke(.{ .HandleResizeEvent = true });
+                try self.event_loop.deferredInvoke(.{ .handle_resize_event = true });
                 self.has_origin_reset_scheduled = true;
             }
         }
@@ -1828,11 +1824,11 @@ pub const Editor = struct {
     }
 
     pub fn getBufferedLineUpTo(self: *Self, index: usize) ![]const u8 {
-        var u8buffer = std.ArrayList(u8).init(self.allocator);
+        var u8buffer: std.ArrayList(u8) = .init(self.allocator);
         defer u8buffer.deinit();
 
         for (self.buffer.container.items[0..index]) |code_point| {
-            var u8buf = [4]u8{ 0, 0, 0, 0 };
+            var u8buf: [4]u8 = @splat(0);
             const length = try std.unicode.utf8Encode(@intCast(code_point), &u8buf);
             try u8buffer.appendSlice(u8buf[0..length]);
         }
@@ -1859,9 +1855,9 @@ pub const Editor = struct {
         state: VTState,
     ) !VTState {
         switch (state) {
-            .Free => {
+            .free => {
                 if (c == 0x1b) {
-                    return .Escape;
+                    return .escape;
                 }
                 if (c == '\r') {
                     current_line.length = 0;
@@ -1879,36 +1875,36 @@ pub const Editor = struct {
                 metrics.total_length += 1;
                 return state;
             },
-            .Escape => {
+            .escape => {
                 if (c == ']') {
                     if (next_c == '0') {
-                        return .Title;
+                        return .title;
                     }
                     return state;
                 }
                 if (c == '[') {
-                    return .Bracket;
+                    return .bracket;
                 }
                 return state;
             },
-            .Bracket => {
+            .bracket => {
                 if (c >= '0' and c <= '9') {
-                    return .BracketArgsSemi;
+                    return .bracket_args_semi;
                 }
                 return state;
             },
-            .BracketArgsSemi => {
+            .bracket_args_semi => {
                 if (c == ';') {
-                    return .Bracket;
+                    return .bracket;
                 }
                 if (c >= '0' and c <= '9') {
                     return state;
                 }
-                return .Free;
+                return .free;
             },
-            .Title => {
+            .title => {
                 if (c == 7) {
-                    return .Free;
+                    return .free;
                 }
                 return state;
             },
@@ -1916,10 +1912,10 @@ pub const Editor = struct {
     }
 
     pub fn actualRenderedStringMetrics(self: *Self, string: []const u8) !StringMetrics {
-        var metrics = StringMetrics.init(self.allocator);
-        var current_line = StringMetrics.LineMetrics{};
+        var metrics: StringMetrics = .init(self.allocator);
+        var current_line: StringMetrics.LineMetrics = .{};
 
-        var state: VTState = .Free;
+        var state: VTState = .free;
 
         for (0..string.len) |i| {
             const c = string[i];
@@ -1939,10 +1935,10 @@ pub const Editor = struct {
     }
 
     pub fn actualRenderedUnicodeStringMetrics(self: *Self, string: []const u32) !StringMetrics {
-        var metrics = StringMetrics.init(self.allocator);
-        var current_line = StringMetrics.LineMetrics{};
+        var metrics: StringMetrics = .init(self.allocator);
+        var current_line: StringMetrics.LineMetrics = .{};
 
-        var state: VTState = .Free;
+        var state: VTState = .free;
 
         for (0..string.len) |i| {
             const c = string[i];
@@ -1973,7 +1969,7 @@ pub const Editor = struct {
     }
 
     pub fn insertCodePoint(self: *Self, code_point: u32) void {
-        var buf = [_]u8{ 0, 0, 0, 0 };
+        var buf: [4]u8 = @splat(0);
         const length = std.unicode.utf8Encode(@intCast(code_point), &buf) catch {
             return;
         };
@@ -2026,55 +2022,55 @@ pub const Editor = struct {
     }
 
     fn setDefaultKeybinds(self: *Self) !void {
-        try self.registerCharInputCallback('\n', &Self.finish);
-        try self.registerCharInputCallback(ctrl('C'), &eatErrors(Self.interrupted));
+        try self.registerCharInputCallback('\n', &finish);
+        try self.registerCharInputCallback(ctrl('C'), &eatErrors(interrupted));
 
         // ^N searchForwards, ^P searchBackwards
-        try self.registerCharInputCallback(ctrl('N'), &Self.searchForwards);
-        try self.registerCharInputCallback(ctrl('P'), &Self.searchBackwards);
+        try self.registerCharInputCallback(ctrl('N'), &searchForwards);
+        try self.registerCharInputCallback(ctrl('P'), &searchBackwards);
         // ^A goHome, ^B cursorLeftCharacter
-        try self.registerCharInputCallback(ctrl('A'), &Self.goHome);
-        try self.registerCharInputCallback(ctrl('B'), &Self.cursorLeftCharacter);
+        try self.registerCharInputCallback(ctrl('A'), &goHome);
+        try self.registerCharInputCallback(ctrl('B'), &cursorLeftCharacter);
         // ^D eraseCharacterForwards, ^E goEnd
-        try self.registerCharInputCallback(ctrl('D'), &Self.eraseCharacterForwards);
-        try self.registerCharInputCallback(ctrl('E'), &Self.goEnd);
+        try self.registerCharInputCallback(ctrl('D'), &eraseCharacterForwards);
+        try self.registerCharInputCallback(ctrl('E'), &goEnd);
         // ^F cursorRightCharacter, ^H eraseCharacterBackwards
-        try self.registerCharInputCallback(ctrl('F'), &Self.cursorRightCharacter);
-        try self.registerCharInputCallback(ctrl('H'), &Self.eraseCharacterBackwards);
+        try self.registerCharInputCallback(ctrl('F'), &cursorRightCharacter);
+        try self.registerCharInputCallback(ctrl('H'), &eraseCharacterBackwards);
         // DEL, some terminals send this instead of ctrl('H')
-        try self.registerCharInputCallback(127, &Self.eraseCharacterBackwards);
+        try self.registerCharInputCallback(127, &eraseCharacterBackwards);
         // ^K eraseToEnd, ^L clearScreen, ^R enterSearch
-        try self.registerCharInputCallback(ctrl('K'), &Self.eraseToEnd);
-        try self.registerCharInputCallback(ctrl('L'), &Self.clearScreen);
-        // FIXME: try self.registerCharInputCallback(ctrl('R'), &Self.enterSearch);
+        try self.registerCharInputCallback(ctrl('K'), &eraseToEnd);
+        try self.registerCharInputCallback(ctrl('L'), &clearScreen);
+        // FIXME: try self.registerCharInputCallback(ctrl('R'), &enterSearch);
         // ^T transposeCharacters
-        try self.registerCharInputCallback(ctrl('T'), &Self.transposeCharacters);
+        try self.registerCharInputCallback(ctrl('T'), &transposeCharacters);
 
         // ^[b cursorLeftWord, ^[f cursorRightWord
-        try self.registerKeyInputCallback(Key{ .code_point = 'b', .modifiers = .Alt }, &Self.cursorLeftWord);
-        try self.registerKeyInputCallback(Key{ .code_point = 'f', .modifiers = .Alt }, &Self.cursorRightWord);
+        try self.registerKeyInputCallback(.{ .code_point = 'b', .modifiers = .alt }, &cursorLeftWord);
+        try self.registerKeyInputCallback(.{ .code_point = 'f', .modifiers = .alt }, &cursorRightWord);
         // ^[^B cursorLeftNonspaceWord, ^[^F cursorRightNonspaceWord
-        try self.registerKeyInputCallback(Key{ .code_point = ctrl('B'), .modifiers = .Alt }, &Self.cursorLeftNonspaceWord);
-        try self.registerKeyInputCallback(Key{ .code_point = ctrl('F'), .modifiers = .Alt }, &Self.cursorRightNonspaceWord);
+        try self.registerKeyInputCallback(.{ .code_point = ctrl('B'), .modifiers = .alt }, &cursorLeftNonspaceWord);
+        try self.registerKeyInputCallback(.{ .code_point = ctrl('F'), .modifiers = .alt }, &cursorRightNonspaceWord);
         // ^[^H eraseAlnumWordBackwards
-        try self.registerKeyInputCallback(Key{ .code_point = ctrl('H'), .modifiers = .Alt }, &Self.eraseAlnumWordBackwards);
+        try self.registerKeyInputCallback(.{ .code_point = ctrl('H'), .modifiers = .alt }, &eraseAlnumWordBackwards);
         // ^[d eraseAlnumWordForwards
-        try self.registerKeyInputCallback(Key{ .code_point = 'd', .modifiers = .Alt }, &Self.eraseAlnumWordForwards);
+        try self.registerKeyInputCallback(.{ .code_point = 'd', .modifiers = .alt }, &eraseAlnumWordForwards);
         // ^[c capitalizeWord, ^[l lowercaseWord, ^[u uppercaseWord, ^[t transposeWords
-        try self.registerKeyInputCallback(Key{ .code_point = 'c', .modifiers = .Alt }, &Self.capitalizeWord);
-        try self.registerKeyInputCallback(Key{ .code_point = 'l', .modifiers = .Alt }, &Self.lowercaseWord);
-        try self.registerKeyInputCallback(Key{ .code_point = 'u', .modifiers = .Alt }, &Self.uppercaseWord);
-        // FIXME: try self.registerKeyInputCallback(Key{ .code_point = 't', .modifiers = .Alt }, &Self.transposeWords);
+        try self.registerKeyInputCallback(.{ .code_point = 'c', .modifiers = .alt }, &capitalizeWord);
+        try self.registerKeyInputCallback(.{ .code_point = 'l', .modifiers = .alt }, &lowercaseWord);
+        try self.registerKeyInputCallback(.{ .code_point = 'u', .modifiers = .alt }, &uppercaseWord);
+        // FIXME: try self.registerKeyInputCallback(.{ .code_point = 't', .modifiers = .alt }, &transposeWords);
 
         // Normally ^W eraseWordBackwards
         // Normally ^U killLine
-        try self.registerCharInputCallback(ctrl('W'), &Self.eraseWordBackwards);
-        try self.registerCharInputCallback(getTermiosCC(self.termios, V.KILL), &Self.killLine);
-        try self.registerCharInputCallback(getTermiosCC(self.termios, V.ERASE), &Self.eraseCharacterBackwards);
+        try self.registerCharInputCallback(ctrl('W'), &eraseWordBackwards);
+        try self.registerCharInputCallback(getTermiosCC(self.termios, V.KILL), &killLine);
+        try self.registerCharInputCallback(getTermiosCC(self.termios, V.ERASE), &eraseCharacterBackwards);
     }
 
     fn registerKeyInputCallback(self: *Self, key: Key, c: *const fn (*Editor) bool) !void {
-        try self.callback_machine.registerKeyInputCallback(&[1]Key{key}, c);
+        try self.callback_machine.registerKeyInputCallback(&.{key}, c);
     }
 
     fn registerKeySequenceInputCallback(self: *Self, seq: []const Key, c: *const fn (*Editor) bool) !void {
@@ -2082,17 +2078,17 @@ pub const Editor = struct {
     }
 
     fn registerCharInputCallback(self: *Self, c: u32, f: *const fn (*Editor) bool) !void {
-        try self.callback_machine.registerKeyInputCallback(&[1]Key{Key{ .code_point = c }}, f);
+        try self.callback_machine.registerKeyInputCallback(&.{.{ .code_point = c }}, f);
     }
 
     fn vtApplyStyle(self: *Self, style: Style, output_stream: anytype, is_starting: bool) !void {
         _ = self;
 
         var buffer: [128]u8 = undefined;
-        var a = std.heap.FixedBufferAllocator.init(&buffer);
+        var fba = std.heap.FixedBufferAllocator.init(&buffer);
 
         if (is_starting) {
-            var allocator = a.allocator();
+            var allocator = fba.allocator();
             const bg = try style.background.toVTEscape(allocator, .background);
             defer allocator.free(bg);
             const fg = try style.foreground.toVTEscape(allocator, .foreground);
@@ -2171,7 +2167,7 @@ pub const Editor = struct {
         self.prohibit_input_processing = true;
         defer self.prohibit_input_processing = false;
 
-        var keybuf = [_]u8{0} ** 32;
+        var keybuf: [32]u8 = @splat(0);
 
         var stdin = SystemCapabilities.getStdIn();
 
@@ -2218,12 +2214,12 @@ pub const Editor = struct {
         };
 
         if (!csi.initialized) {
-            csi.intermediate_bytes = std.ArrayList(u8).init(self.allocator);
-            csi.parameter_bytes = std.ArrayList(u8).init(self.allocator);
+            csi.intermediate_bytes = .init(self.allocator);
+            csi.parameter_bytes = .init(self.allocator);
             csi.initialized = true;
         }
 
-        var csi_parameters = std.ArrayList(u32).init(self.allocator);
+        var csi_parameters: std.ArrayList(u32) = .init(self.allocator);
         defer csi_parameters.deinit();
 
         var csi_final: u8 = 0;
@@ -2240,35 +2236,35 @@ pub const Editor = struct {
             }
 
             switch (self.input_state) {
-                .GotEscape => switch (code_point) {
+                .got_escape => switch (code_point) {
                     '[' => {
-                        self.input_state = .CSIExpectParameter;
+                        self.input_state = .csi_expect_parameter;
                         continue;
                     },
                     else => {
-                        try self.callback_machine.keyPressed(self, Key{ .code_point = code_point, .modifiers = .Alt });
-                        self.input_state = .Free;
+                        try self.callback_machine.keyPressed(self, .{ .code_point = code_point, .modifiers = .alt });
+                        self.input_state = .free;
                         continue;
                     },
                 },
-                .CSIExpectParameter, .CSIExpectIntermediate, .CSIExpectFinal => {
-                    if (self.input_state == .CSIExpectParameter) {
+                .csi_expect_parameter, .csi_expect_intermediate, .csi_expect_final => {
+                    if (self.input_state == .csi_expect_parameter) {
                         if (code_point >= 0x30 and code_point <= 0x3f) { // '0123456789:;<=>?'
                             try csi.parameter_bytes.append(@intCast(code_point));
                             continue;
                         }
-                        self.input_state = .CSIExpectIntermediate;
+                        self.input_state = .csi_expect_intermediate;
                     }
-                    if (self.input_state == .CSIExpectIntermediate) {
+                    if (self.input_state == .csi_expect_intermediate) {
                         if (code_point >= 0x20 and code_point <= 0x2f) { // ' !"#$%&\'()*+,-./'
                             try csi.intermediate_bytes.append(@intCast(code_point));
                             continue;
                         }
-                        self.input_state = .CSIExpectFinal;
+                        self.input_state = .csi_expect_final;
                     }
-                    if (self.input_state == .CSIExpectFinal) {
+                    if (self.input_state == .csi_expect_final) {
                         self.input_state = self.previous_free_state;
-                        const is_in_paste = self.input_state == .Paste;
+                        const is_in_paste = self.input_state == .paste;
                         var it = std.mem.splitScalar(u8, csi.parameter_bytes.items, ';');
                         while (it.next()) |parameter| {
                             if (std.fmt.parseInt(u8, parameter, 10) catch null) |value| {
@@ -2286,7 +2282,7 @@ pub const Editor = struct {
                             param2 = csi_parameters.items[1];
                         }
 
-                        var modifiers: CSIMod = .None;
+                        var modifiers: CSIMod = .none;
                         if (param2 != 0) {
                             modifiers = @enumFromInt(@as(u8, @intCast(param2 - 1)));
                         }
@@ -2332,7 +2328,7 @@ pub const Editor = struct {
                                 continue;
                             },
                             'D' => { // ^[[D: arrow left
-                                if (modifiers == .Alt or modifiers == .Ctrl) {
+                                if (modifiers == .alt or modifiers == .ctrl) {
                                     _ = self.cursorLeftWord();
                                 } else {
                                     _ = self.cursorLeftCharacter();
@@ -2340,7 +2336,7 @@ pub const Editor = struct {
                                 continue;
                             },
                             'C' => { // ^[[C: arrow right
-                                if (modifiers == .Alt or modifiers == .Ctrl) {
+                                if (modifiers == .alt or modifiers == .ctrl) {
                                     _ = self.cursorRightWord();
                                 } else {
                                     _ = self.cursorRightCharacter();
@@ -2356,7 +2352,7 @@ pub const Editor = struct {
                                 continue;
                             },
                             127 => {
-                                if (modifiers == .Ctrl) {
+                                if (modifiers == .ctrl) {
                                     // TODO: self.eraseAlnumWordBackwards();
                                 } else {
                                     _ = self.eraseCharacterBackwards();
@@ -2365,7 +2361,7 @@ pub const Editor = struct {
                             },
                             '~' => {
                                 if (param1 == 3) { // ^[[3~: delete
-                                    if (modifiers == .Ctrl) {
+                                    if (modifiers == .ctrl) {
                                         // TODO: self.eraseAlnumWordForwards();
                                     } else {
                                         _ = self.eraseCharacterForwards();
@@ -2377,11 +2373,11 @@ pub const Editor = struct {
                                     // ^[[200~: start bracketed paste
                                     // ^[[201~: end bracketed paste
                                     if (!is_in_paste and param1 == 200) {
-                                        self.input_state = .Paste;
+                                        self.input_state = .paste;
                                         continue;
                                     }
                                     if (is_in_paste and param1 == 201) {
-                                        self.input_state = .Free;
+                                        self.input_state = .free;
                                         if (self.on.paste) |*cb| {
                                             cb.f(cb.context, self.paste_buffer.container.items);
                                             self.paste_buffer.container.clearRetainingCapacity();
@@ -2403,16 +2399,16 @@ pub const Editor = struct {
                         unreachable;
                     }
                 },
-                .Verbatim => {
-                    self.input_state = .Free;
+                .verbatim => {
+                    self.input_state = .free;
                     // Verbatim mode will bypass all mechanisms and just insert the code point.
                     self.insertCodePoint(code_point);
                     continue;
                 },
-                .Paste => {
+                .paste => {
                     if (code_point == 27) {
-                        self.previous_free_state = .Paste;
-                        self.input_state = .GotEscape;
+                        self.previous_free_state = .paste;
+                        self.input_state = .got_escape;
                         continue;
                     }
 
@@ -2423,21 +2419,21 @@ pub const Editor = struct {
                     }
                     continue;
                 },
-                .Free => {
-                    self.previous_free_state = .Free;
+                .free => {
+                    self.previous_free_state = .free;
                     if (code_point == 27) {
-                        try self.callback_machine.keyPressed(self, Key{ .code_point = code_point });
+                        try self.callback_machine.keyPressed(self, .{ .code_point = code_point });
                         // Note that this should also deal with explicitly registered keys
                         // that would otherwise be interpreted as escapes.
                         if (self.callback_machine.shouldProcessLastPressedKey()) {
-                            self.input_state = .GotEscape;
+                            self.input_state = .got_escape;
                         }
                         continue;
                     }
                     if (code_point == 22) { // ^v
-                        try self.callback_machine.keyPressed(self, Key{ .code_point = code_point });
+                        try self.callback_machine.keyPressed(self, .{ .code_point = code_point });
                         if (self.callback_machine.shouldProcessLastPressedKey()) {
-                            self.input_state = .Verbatim;
+                            self.input_state = .verbatim;
                         }
                         continue;
                     }
@@ -2458,7 +2454,7 @@ pub const Editor = struct {
                 continue;
             }
 
-            try self.callback_machine.keyPressed(self, Key{ .code_point = code_point });
+            try self.callback_machine.keyPressed(self, .{ .code_point = code_point });
             if (!self.callback_machine.shouldProcessLastPressedKey()) {
                 continue;
             }
@@ -2488,7 +2484,7 @@ pub const Editor = struct {
         }
 
         if (self.incomplete_data.container.items.len != 0 and !self.finished) {
-            try self.event_loop.loopAction(.Retry);
+            try self.event_loop.loopAction(.retry);
         }
     }
 
@@ -2496,7 +2492,7 @@ pub const Editor = struct {
         self.has_origin_reset_scheduled = false;
         if (reset_origin and !self.setOrigin(false)) {
             self.has_origin_reset_scheduled = true;
-            try self.event_loop.deferredInvoke(.{ .HandleResizeEvent = true });
+            try self.event_loop.deferredInvoke(.{ .handle_resize_event = true });
             return;
         }
 
@@ -2523,10 +2519,10 @@ pub const Editor = struct {
     }
 
     fn vtDSR(self: *Self) ![2]usize {
-        var buf = [_]u8{0} ** 32;
+        var buf: [32]u8 = @splat(0);
         var more_junk_to_read = false;
         var stdin = SystemCapabilities.getStdIn();
-        var pollfds = [1]SystemCapabilities.pollfd{undefined};
+        var pollfds: [1]SystemCapabilities.pollfd = @splat(undefined);
         {
             var pollfd: SystemCapabilities.pollfd = undefined;
             SystemCapabilities.setPollFd(&pollfd, stdin.handle);
@@ -2563,22 +2559,22 @@ pub const Editor = struct {
         _ = try stderr.write("\x1b[6n");
 
         var state: enum {
-            Free,
-            SawEsc,
-            SawBracket,
-            InFirstCoordinate,
-            SawSemicolon,
-            InSecondCoordinate,
-            SawR,
-        } = .Free;
+            free,
+            saw_esc,
+            saw_bracket,
+            in_first_coordinate,
+            saw_semicolon,
+            in_second_coordinate,
+            saw_r,
+        } = .free;
         var has_error = false;
-        var coordinate_buffer = [8]u8{ 0, 0, 0, 0, 0, 0, 0, 0 };
+        var coordinate_buffer: [8]u8 = @splat(0);
         var coordinate_length: usize = 0;
         var row: usize = 0;
         var column: usize = 0;
 
-        while (state != .SawR) {
-            var b = [1]u8{0};
+        while (state != .saw_r) {
+            var b: [1]u8 = .{0};
             const length = try stdin.read(&b);
             if (length == 0) {
                 logger.debug("Got EOF while reading DSR response", .{});
@@ -2588,32 +2584,32 @@ pub const Editor = struct {
             const c = b[0];
 
             switch (state) {
-                .Free => {
+                .free => {
                     if (c == 0x1b) {
-                        state = .SawEsc;
+                        state = .saw_esc;
                         continue;
                     }
                     try self.incomplete_data.container.append(c);
                 },
-                .SawEsc => {
+                .saw_esc => {
                     if (c == '[') {
-                        state = .SawBracket;
+                        state = .saw_bracket;
                         continue;
                     }
                     try self.incomplete_data.container.append(c);
-                    state = .Free;
+                    state = .free;
                 },
-                .SawBracket => {
+                .saw_bracket => {
                     if (c >= '0' and c <= '9') {
-                        state = .InFirstCoordinate;
+                        state = .in_first_coordinate;
                         coordinate_buffer[0] = c;
                         coordinate_length = 1;
                         continue;
                     }
                     try self.incomplete_data.container.append(c);
-                    state = .Free;
+                    state = .free;
                 },
-                .InFirstCoordinate => {
+                .in_first_coordinate => {
                     if (c >= '0' and c <= '9') {
                         if (coordinate_length < coordinate_buffer.len) {
                             coordinate_buffer[coordinate_length] = c;
@@ -2622,7 +2618,7 @@ pub const Editor = struct {
                         continue;
                     }
                     if (c == ';') {
-                        state = .SawSemicolon;
+                        state = .saw_semicolon;
                         // parse the first coordinate
                         row = std.fmt.parseInt(u8, coordinate_buffer[0..coordinate_length], 10) catch v: {
                             has_error = true;
@@ -2632,19 +2628,19 @@ pub const Editor = struct {
                         continue;
                     }
                     try self.incomplete_data.container.append(c);
-                    state = .Free;
+                    state = .free;
                 },
-                .SawSemicolon => {
+                .saw_semicolon => {
                     if (c >= '0' and c <= '9') {
-                        state = .InSecondCoordinate;
+                        state = .in_second_coordinate;
                         coordinate_buffer[0] = c;
                         coordinate_length = 1;
                         continue;
                     }
                     try self.incomplete_data.container.append(c);
-                    state = .Free;
+                    state = .free;
                 },
-                .InSecondCoordinate => {
+                .in_second_coordinate => {
                     if (c >= '0' and c <= '9') {
                         if (coordinate_length < coordinate_buffer.len) {
                             coordinate_buffer[coordinate_length] = c;
@@ -2654,7 +2650,7 @@ pub const Editor = struct {
                     }
                     if (c == 'R') {
                         // parse the second coordinate
-                        state = .SawR;
+                        state = .saw_r;
                         column = std.fmt.parseInt(u8, coordinate_buffer[0..coordinate_length], 10) catch v: {
                             has_error = true;
                             break :v 1;
@@ -2663,9 +2659,7 @@ pub const Editor = struct {
                     }
                     try self.incomplete_data.container.append(c);
                 },
-                .SawR => {
-                    unreachable;
-                },
+                .saw_r => unreachable,
             }
         }
 
@@ -2673,7 +2667,7 @@ pub const Editor = struct {
             logger.debug("Couldn't parse DSR response", .{});
         }
 
-        return [2]usize{ row, column };
+        return .{ row, column };
     }
 
     fn removeAtIndex(self: *Self, index: usize) void {
@@ -2691,18 +2685,18 @@ pub const Editor = struct {
         self.drawn_cursor = 0;
         self.inline_search_cursor = 0;
         self.search_offset = 0;
-        self.search_offset_state = .Unbiased;
+        self.search_offset_state = .unbiased;
         self.old_prompt_metrics = self.cached_prompt_metrics;
         self.origin_row = 0;
         self.origin_column = 0;
         self.prompt_lines_at_suggestion_initiation = 0;
         self.refresh_needed = true;
         self.input_error = null;
-        self.returned_line = &[0]u8{};
+        self.returned_line = &.{};
         self.chars_touched_in_the_middle = 0;
         self.drawn_end_of_line_offset = 0;
         self.current_spans.deinit();
-        self.current_spans = DrawnSpans.init(self.allocator);
+        self.current_spans = .init(self.allocator);
         if (self.drawn_spans) |*spans| {
             spans.deinit();
         }
@@ -2719,12 +2713,10 @@ pub const Editor = struct {
             var i = self.history_cursor;
             while (i > 0) : (i -= 1) {
                 const entry = self.history.container.items[i - 1];
-                // Dear zig fmt, please understand that sometimes you have to break lines.
-                const contains = if (from_beginning) r: {
-                    break :r std.mem.startsWith(u8, entry.entry.container.items, phrase);
-                } else r: {
-                    break :r std.mem.containsAtLeast(u8, entry.entry.container.items, 1, phrase);
-                };
+                const contains = if (from_beginning)
+                    std.mem.startsWith(u8, entry.entry, phrase)
+                else
+                    std.mem.containsAtLeast(u8, entry.entry, 1, phrase);
                 if (contains) {
                     last_matching_offset = @as(i32, @intCast(i)) - 1;
                     if (search_offset == 0) {
@@ -2747,7 +2739,7 @@ pub const Editor = struct {
             self.chars_touched_in_the_middle = self.buffer.container.items.len;
             self.buffer.container.clearRetainingCapacity();
             self.cursor = 0;
-            self.insertString(self.history.container.items[@intCast(last_matching_offset)].entry.container.items);
+            self.insertString(self.history.container.items[@intCast(last_matching_offset)].entry);
             // Always needed.
             self.refresh_needed = true;
         }
@@ -2772,7 +2764,7 @@ pub const Editor = struct {
     }
 
     fn findApplicableStyle(self: *Self, index: usize) Style {
-        var style = Style.resetStyle();
+        var style: Style = .reset;
         var it = self.current_spans.starting.container.iterator();
         while (it.next()) |entry| {
             unifyStylesInto(entry, index, &style);
@@ -2857,7 +2849,7 @@ pub const Editor = struct {
             cb.f(cb.context);
         }
 
-        var empty_styles = AutoHashMap(usize, Style).init(self.allocator);
+        var empty_styles: AutoHashMap(usize, Style) = .init(self.allocator);
         defer empty_styles.deinit();
 
         if (self.cached_prompt_valid) {
@@ -2868,7 +2860,7 @@ pub const Editor = struct {
                     try self.applyStyles(&empty_styles, &buffered_output, i);
                     try self.printCharacterAt(i, &buffered_output);
                 }
-                try self.vtApplyStyle(Style.resetStyle(), &buffered_output, true);
+                try self.vtApplyStyle(.reset, &buffered_output, true);
                 self.pending_chars.container.clearAndFree();
                 self.drawn_cursor = self.cursor;
                 self.drawn_end_of_line_offset = self.buffer.size();
@@ -2894,7 +2886,7 @@ pub const Editor = struct {
             try self.printCharacterAt(i, &buffered_output);
         }
 
-        try self.vtApplyStyle(Style.resetStyle(), &buffered_output, true);
+        try self.vtApplyStyle(.reset, &buffered_output, true);
 
         self.pending_chars.container.clearAndFree();
         self.refresh_needed = false;
@@ -2937,7 +2929,7 @@ pub const Editor = struct {
         }).value_ptr;
 
         if (ends.container.count() > 0) {
-            var style = Style{};
+            var style: Style = .{};
 
             var it = ends.container.unmanaged.iterator();
             while (it.next()) |entry| {
@@ -2953,7 +2945,7 @@ pub const Editor = struct {
         }
 
         if (starts.container.count() > 0) {
-            var style = Style{};
+            var style: Style = .{};
             var it = starts.container.unmanaged.iterator();
             while (it.next()) |entry| {
                 style.unifyWith(entry.value_ptr.*, true);
@@ -2969,7 +2961,7 @@ pub const Editor = struct {
     }
 
     fn printSingleCharacter(self: *Self, code_point: u32, output_stream: anytype) !void {
-        var buffer = std.ArrayList(u8).init(self.allocator);
+        var buffer: std.ArrayList(u8) = .init(self.allocator);
         defer buffer.deinit();
 
         const should_print_masked = isAsciiControl(code_point) and code_point != '\n';
@@ -3026,7 +3018,7 @@ pub const Editor = struct {
             self.restore() catch {};
         }
 
-        try self.event_loop.loopAction(.Exit);
+        try self.event_loop.loopAction(.exit);
     }
 
     fn restore(self: *Self) !void {
@@ -3230,13 +3222,13 @@ pub const Editor = struct {
         const p = sane.checkpoint(&self.inline_search_cursor);
         defer p.restore();
 
-        var builder = sane.StringBuilder.init(self.allocator);
+        var builder: StringBuilder = .init(self.allocator);
         defer builder.deinit();
 
         builder.appendUtf32Slice(self.buffer.container.items[0..self.inline_search_cursor]) catch return false;
         const search_phrase = builder.toSlice();
 
-        if (self.search_offset_state == .Backwards) {
+        if (self.search_offset_state == .backwards) {
             if (self.search_offset > 0) {
                 self.search_offset -= 1;
             }
@@ -3248,13 +3240,13 @@ pub const Editor = struct {
 
             self.search_offset -= 1;
             if (self.search(search_phrase, true, true)) {
-                self.search_offset_state = .Forwards;
+                self.search_offset_state = .forwards;
                 p1.v = self.search_offset;
             } else {
-                self.search_offset_state = .Unbiased;
+                self.search_offset_state = .unbiased;
             }
         } else {
-            self.search_offset_state = .Unbiased;
+            self.search_offset_state = .unbiased;
             self.chars_touched_in_the_middle = self.buffer.size();
             self.cursor = 0;
             self.buffer.container.clearRetainingCapacity();
@@ -3269,21 +3261,21 @@ pub const Editor = struct {
         const p = sane.checkpoint(&self.inline_search_cursor);
         defer p.restore();
 
-        var builder = sane.StringBuilder.init(self.allocator);
+        var builder: StringBuilder = .init(self.allocator);
         defer builder.deinit();
 
         builder.appendUtf32Slice(self.buffer.container.items[0..self.inline_search_cursor]) catch return false;
         const search_phrase = builder.toSlice();
 
-        if (self.search_offset_state == .Forwards) {
+        if (self.search_offset_state == .forwards) {
             self.search_offset += 1;
         }
 
         if (self.search(search_phrase, true, true)) {
-            self.search_offset_state = .Backwards;
+            self.search_offset_state = .backwards;
             self.search_offset += 1;
         } else {
-            self.search_offset_state = .Unbiased;
+            self.search_offset_state = .unbiased;
             if (self.search_offset > 0) {
                 self.search_offset -= 1;
             }
@@ -3461,17 +3453,17 @@ pub const Editor = struct {
     }
 
     pub fn capitalizeWord(self: *Self) bool {
-        self.caseChangeWord(.Capital);
+        self.caseChangeWord(.capital);
         return false;
     }
 
     pub fn lowercaseWord(self: *Self) bool {
-        self.caseChangeWord(.Lower);
+        self.caseChangeWord(.lower);
         return false;
     }
 
     pub fn uppercaseWord(self: *Self) bool {
-        self.caseChangeWord(.Upper);
+        self.caseChangeWord(.upper);
         return false;
     }
 
@@ -3489,13 +3481,13 @@ pub const Editor = struct {
         return false;
     }
 
-    fn caseChangeWord(self: *Self, op: enum { Lower, Upper, Capital }) void {
+    fn caseChangeWord(self: *Self, op: enum { lower, upper, capital }) void {
         while (self.cursor < self.buffer.size() and !isAsciiAlnum(self.buffer.container.items[self.cursor])) {
             self.cursor += 1;
         }
         const start = self.cursor;
         while (self.cursor < self.buffer.size() and isAsciiAlnum(self.buffer.container.items[self.cursor])) {
-            if (op == .Upper or (op == .Capital and self.cursor == start)) {
+            if (op == .upper or (op == .capital and self.cursor == start)) {
                 self.buffer.container.items[self.cursor] = std.ascii.toUpper(@intCast(self.buffer.container.items[self.cursor]));
             } else {
                 self.buffer.container.items[self.cursor] = std.ascii.toLower(@intCast(self.buffer.container.items[self.cursor]));
