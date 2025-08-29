@@ -9,9 +9,10 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps: 
-      - uses: actions/checkout@v3
-      - name: setup zig
-        uses: goto-bus-stop/setup-zig@v2.1.1
+      - uses: actions/checkout@v5
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.14.1
       - name: Check format
         run: zig fmt --check src
       - name: Build
