@@ -1,0 +1,12 @@
+.{
+    .name = .zigline,
+    .version = "0.1.0",
+    .fingerprint = 0x21cdce3e076c59ea,
+    .paths = .{
+        "LICENSE",
+        "README.md",
+        "build.zig",
+        "build.zig.zon",
+        "src/",
+    },
+}

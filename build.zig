@@ -15,15 +15,24 @@ pub fn build(b: *std.Build) void {
     // set a preferred release mode, allowing the user to decide how to optimize.
     const optimize = b.standardOptimizeOption(.{});
 
-    _ = b.addModule("zigline", .{
+    const module = b.addModule("zigline", .{
         .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
     });
 
     const exe = b.addExecutable(.{
         .name = "zigline-test",
-        .root_source_file = b.path("src/example.zig"),
-        .target = target,
-        .optimize = optimize,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/example.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = switch (target.result.os.tag) {
+                // Using std.posix on windows and wasi requires libc
+                .windows, .wasi => true,
+                else => null,
+            },
+        }),
     });
 
     // This declares intent for the executable to be installed into the
@@ -57,9 +66,7 @@ pub fn build(b: *std.Build) void {
     // Creates a step for unit testing. This only builds the test executable
     // but does not run it.
     const main_tests = b.addTest(.{
-        .root_source_file = b.path("src/main.zig"),
-        .target = target,
-        .optimize = optimize,
+        .root_module = module,
     });
 
     const run_main_tests = b.addRunArtifact(main_tests);

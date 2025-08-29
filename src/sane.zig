@@ -18,7 +18,7 @@ fn DeinitingAutoHashMap(comptime K: type, comptime V: type, comptime deinit_key:
 
         pub fn init(allocator: Allocator) Self {
             return .{
-                .container = std.AutoHashMap(K, V).init(allocator),
+                .container = .init(allocator),
             };
         }
 
@@ -42,8 +42,8 @@ fn DeinitingArrayList(comptime T: type, comptime deinit_fn: anytype) type {
         }
 
         pub fn init(allocator: Allocator) Self {
-            return Self{
-                .container = std.ArrayList(T).init(allocator),
+            return .{
+                .container = .init(allocator),
             };
         }
 
@@ -91,8 +91,8 @@ pub fn Queue(comptime T: type) type {
 
         const Self = @This();
         pub fn init(allocator: Allocator) Self {
-            return Self{
-                .container = ArrayList(T).init(allocator),
+            return .{
+                .container = .init(allocator),
             };
         }
 
@@ -142,7 +142,7 @@ pub const StringBuilder = struct {
 
     pub fn init(allocator: Allocator) Self {
         return .{
-            .buffer = ArrayList(u8).init(allocator),
+            .buffer = .init(allocator),
         };
     }
 
@@ -151,7 +151,7 @@ pub const StringBuilder = struct {
     }
 
     pub fn appendCodePoint(self: *Self, c: u32) !void {
-        var buf: [4]u8 = [_]u8{0} ** 4;
+        var buf: [4]u8 = @splat(0);
         const length = try std.unicode.utf8Encode(@intCast(c), &buf);
         try self.buffer.container.appendSlice(buf[0..length]);
     }
