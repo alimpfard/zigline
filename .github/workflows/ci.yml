@@ -5,16 +5,38 @@ on:
     branches: [ "master" ]
   pull_request:
     branches: [ "master" ]
+
 jobs:
-  build:
+  check-format:
     runs-on: ubuntu-latest
-    steps: 
+    steps:
       - uses: actions/checkout@v5
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.14.1
       - name: Check format
         run: zig fmt --check src
+
+  build-native:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.14.1
       - name: Build
         run: zig build
-        
+
+  build-cross:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target: [ "x86_64-linux-musl", "aarch64-macos-none", "x86-windows-gnu", "x86_64-uefi-gnu" ]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.14.1
+      - name: Build
+        run: zig build -Dtarget=${{ matrix.target }}
+
