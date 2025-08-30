@@ -171,7 +171,7 @@ pub const SystemCapabilities = switch (builtin.os.tag) {
         };
         pub const nfds_t = u32;
 
-        pub const default_operation_mode = Configuration.OperationMode.NonInteractive;
+        pub const default_operation_mode: Configuration.OperationMode = .non_interactive;
 
         const WriterContext = struct {
             console_out: *std.os.uefi.protocol.SimpleTextOutput,
