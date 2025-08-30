@@ -14,7 +14,19 @@ const builtin = @import("builtin");
 const is_windows = builtin.os.tag == .windows;
 const should_enable_signal_handling = !is_windows and builtin.os.tag != .wasi and builtin.os.tag != .uefi;
 
-const logger = std.log.scoped(.zigline);
+const logger = switch (builtin.os.tag) {
+    .uefi => struct {
+        pub fn debug(fmt: []const u8, args: anytype) void {
+            _ = fmt;
+            _ = args;
+        }
+        pub fn info(fmt: []const u8, args: anytype) void {
+            _ = fmt;
+            _ = args;
+        }
+    },
+    else => std.log.scoped(.zigline),
+};
 
 fn Wrapped(comptime T: type) type {
     return struct {
