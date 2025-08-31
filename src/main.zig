@@ -5,6 +5,7 @@ const Condition = Thread.Condition;
 const Mutex = Thread.Mutex;
 
 const sane = @import("sane.zig");
+const uefi = @import("uefi.zig");
 const ArrayList = sane.ArrayList;
 const AutoHashMap = sane.AutoHashMap;
 const Queue = sane.Queue;
@@ -12,21 +13,12 @@ const StringBuilder = sane.StringBuilder;
 
 const builtin = @import("builtin");
 const is_windows = builtin.os.tag == .windows;
-const should_enable_signal_handling = !is_windows and builtin.os.tag != .wasi and builtin.os.tag != .uefi;
-
-const logger = switch (builtin.os.tag) {
-    .uefi => struct {
-        pub fn debug(fmt: []const u8, args: anytype) void {
-            _ = fmt;
-            _ = args;
-        }
-        pub fn info(fmt: []const u8, args: anytype) void {
-            _ = fmt;
-            _ = args;
-        }
-    },
-    else => std.log.scoped(.zigline),
+const should_enable_signal_handling = switch (builtin.os.tag) {
+    .windows, .wasi, .uefi => false,
+    else => true,
 };
+
+const logger = std.log.scoped(.zigline);
 
 fn Wrapped(comptime T: type) type {
     return struct {
@@ -74,9 +66,9 @@ pub const SystemCapabilities = switch (builtin.os.tag) {
 
         pub const default_operation_mode: Configuration.OperationMode = .non_interactive;
 
-        pub const getStdIn = std.io.getStdIn;
-        pub const getStdOut = std.io.getStdOut;
-        pub const getStdErr = std.io.getStdErr;
+        pub const stdin = std.fs.File.stdin;
+        pub const stdout = std.fs.File.stdout;
+        pub const stderr = std.fs.File.stderr;
 
         pub const winsize = struct {
             col: u16,
@@ -185,144 +177,57 @@ pub const SystemCapabilities = switch (builtin.os.tag) {
 
         pub const default_operation_mode: Configuration.OperationMode = .non_interactive;
 
-        const WriterContext = struct {
-            console_out: *std.os.uefi.protocol.SimpleTextOutput,
-            attribute: usize,
-        };
-
-        const ReaderContext = struct {
-            console_in: *std.os.uefi.protocol.SimpleTextInput,
-        };
-
-        const Writer = std.io.GenericWriter(
-            WriterContext,
-            error{},
-            struct {
-                fn write(context: WriterContext, bytes: []const u8) error{}!usize {
-                    _ = context.console_out.setAttribute(context.attribute);
-                    for (bytes) |c| {
-                        _ = context.console_out.outputString(@ptrCast(&[2]u16{ c, 0 }));
-                    }
-                    return bytes.len;
-                }
-            }.write,
-        );
-
-        const Reader = std.io.GenericReader(
-            ReaderContext,
-            error{},
-            struct {
-                fn read(context: ReaderContext, bytes: []u8) error{}!usize {
-                    var i: usize = 0;
-                    const writer = getStdOut().writer();
-                    var key: std.os.uefi.protocol.SimpleTextInputEx.Key.Input = undefined;
-                    var status: std.os.uefi.Status = .not_ready;
-                    while (true) {
-                        status = context.console_in.readKeyStroke(&key);
-                        if (status == .success) {
-                            if (key.scan_code == 0) {
-                                if (key.unicode_char == 0xd or key.unicode_char == 0xa) {
-                                    bytes[i] = '\n';
-                                    i += 1;
-                                    writer.writeAll("\r\n") catch {};
-                                    break;
-                                }
-
-                                i += std.unicode.utf8Encode(key.unicode_char, bytes[i..]) catch 0;
-                                writer.writeAll(bytes[0..i]) catch {};
-                            }
-                            break;
-                        }
-                    }
-
-                    while (i < bytes.len) {
-                        status = context.console_in.readKeyStroke(&key);
-                        if (status == .success) {
-                            if (key.scan_code == 0) {
-                                if (key.unicode_char == 0xd or key.unicode_char == 0xa) {
-                                    bytes[i] = '\n';
-                                    i += 1;
-                                    writer.writeAll("\r\n") catch {};
-                                    break;
-                                }
-
-                                i += std.unicode.utf8Encode(key.unicode_char, bytes[i..]) catch 0;
-                                writer.writeAll(bytes[0..i]) catch {};
-                            }
-                        } else break;
-                    }
-                    return i;
-                }
-            }.read,
-        );
-
         const File = struct {
-            _reader: ?Reader,
-            _writer: ?Writer,
-            handle: u0 = undefined,
+            handle: enum {
+                stdin,
+                stdout,
+                stderr,
+            },
 
-            pub fn reader(self: *const @This()) Reader {
-                return self._reader.?;
+            pub fn reader(self: File, buffer: []u8) uefi.Reader {
+                return switch (self.handle) {
+                    .stdin => .init(
+                        buffer,
+                        std.os.uefi.system_table.con_in.?,
+                        std.os.uefi.system_table.con_out.?,
+                        .{ .foreground = .white },
+                    ),
+                    .stdout, .stderr => unreachable,
+                };
             }
 
-            pub fn writer(self: *const @This()) Writer {
-                return self._writer.?;
+            pub fn writer(self: File, buffer: []u8) uefi.Writer {
+                return switch (self.handle) {
+                    .stdout => .init(
+                        buffer,
+                        std.os.uefi.system_table.con_out.?,
+                        .{ .foreground = .white },
+                    ),
+                    .stderr => .init(
+                        buffer,
+                        std.os.uefi.system_table.con_out.?,
+                        .{ .foreground = .red },
+                    ),
+                    .stdin => unreachable,
+                };
             }
 
-            pub fn write(self: *const @This(), bytes: []const u8) !usize {
-                return self.writer().write(bytes);
-            }
-
-            pub fn writeAll(self: *const @This(), bytes: []const u8) !void {
-                var i: usize = 0;
-                while (i < bytes.len) {
-                    const n = try self.write(bytes[i..]);
-                    if (n == 0) {
-                        break;
-                    }
-                    i += n;
-                }
-            }
-
-            pub fn read(self: *const @This(), bytes: []u8) !usize {
-                return self.reader().read(bytes);
+            // Direct `read()` is only needed for poll so we can stub it out
+            pub fn read(_: File, _: []u8) !usize {
+                return 0;
             }
         };
 
-        pub fn getStdIn() File {
-            return .{
-                ._reader = .{
-                    .context = .{
-                        .console_in = std.os.uefi.system_table.con_in.?,
-                    },
-                },
-                ._writer = null,
-            };
+        pub fn stdin() File {
+            return .{ .handle = .stdin };
         }
 
-        pub fn getStdOut() File {
-            return .{
-                ._reader = null,
-                ._writer = .{
-                    .context = .{
-                        .console_out = std.os.uefi.system_table.con_out.?,
-                        .attribute = 0x7, // white
-                    },
-                },
-            };
+        pub fn stdout() File {
+            return .{ .handle = .stdout };
         }
 
-        pub fn getStdErr() File {
-            return .{
-                ._reader = null,
-                ._writer = .{
-                    .context = .{
-                        .console_out = std.os.uefi.system_table.con_out.?,
-                        .attribute = 0x4, // red
-                    },
-                },
-                .handle = undefined,
-            };
+        pub fn stderr() File {
+            return .{ .handle = .stderr };
         }
 
         pub const winsize = struct {
@@ -384,9 +289,9 @@ pub const SystemCapabilities = switch (builtin.os.tag) {
 
         pub const default_operation_mode: Configuration.OperationMode = .full;
 
-        pub const getStdIn = std.io.getStdIn;
-        pub const getStdOut = std.io.getStdOut;
-        pub const getStdErr = std.io.getStdErr;
+        pub const stdin = std.fs.File.stdin;
+        pub const stdout = std.fs.File.stdout;
+        pub const stderr = std.fs.File.stderr;
 
         pub fn getWinsize(handle: anytype) !std.posix.winsize {
             var ws: std.posix.winsize = undefined;
@@ -905,12 +810,13 @@ fn vtMoveRelative(row: i64, col: i64) !void {
         c = -col;
     }
 
-    var writer = SystemCapabilities.getStdErr().writer();
+    var stderr_writer = SystemCapabilities.stderr().writer(&.{});
+    const stderr = &stderr_writer.interface;
     if (row > 0) {
-        try writer.print("\x1b[{d}{c}", .{ r, x_op });
+        try stderr.print("\x1b[{d}{c}", .{ r, x_op });
     }
     if (col > 0) {
-        try writer.print("\x1b[{d}{c}", .{ c, y_op });
+        try stderr.print("\x1b[{d}{c}", .{ c, y_op });
     }
 }
 
@@ -923,27 +829,15 @@ var signalHandlingData: ?struct {
     old_sigwinch: ?SystemCapabilities.Sigaction = null,
 
     pub fn handleSignal(signo: i32) callconv(.c) void {
-        var f: std.fs.File = .{ .handle = signalHandlingData.?.pipe.write };
-        f.writer().writeInt(i32, signo, .little) catch {};
+        var file: std.fs.File = .{ .handle = signalHandlingData.?.pipe.write };
+        var buffer: [4]u8 = undefined;
+        var file_writer = file.writer(&buffer);
+        const writer = &file_writer.interface;
+        writer.writeInt(i32, signo, .little) catch {};
     }
 } = null;
 
 pub const Editor = struct {
-    pub const Error =
-        std.mem.Allocator.Error ||
-        std.posix.MMapError ||
-        std.posix.OpenError ||
-        std.posix.PipeError ||
-        std.posix.ReadError ||
-        std.posix.RealPathError ||
-        std.posix.TermiosGetError ||
-        std.posix.TermiosSetError ||
-        std.posix.WriteError ||
-        error{ CodepointTooLarge, Utf8CannotEncodeSurrogateHalf } ||
-        error{ Empty, Eof, ReadFailure } ||
-        error{ EndOfStream, StreamTooLong, OperationNotSupported } ||
-        error{ SystemResource, ThreadQuotaExceeded };
-
     pub const Signal = enum {
         SIGWINCH,
     };
@@ -1050,6 +944,14 @@ pub const Editor = struct {
         };
     }
 
+    // Error set stored in `input_error`
+    const InputError =
+        std.Io.Writer.Error ||
+        std.mem.Allocator.Error ||
+        std.posix.PipeError ||
+        std.posix.ReadError ||
+        error{ Empty, Eof, SystemResource };
+
     on: struct {
         display_refresh: ?Callback = null,
         paste: ?Callback1([]const u32) = null,
@@ -1071,7 +973,7 @@ pub const Editor = struct {
     pre_search_buffer: ArrayList(u32),
     pending_chars: ArrayList(u8),
     incomplete_data: ArrayList(u8),
-    input_error: ?Wrapped(Error) = null, // ?Error behaves weirdly - `null` seems to be equal to whatever error number 0 represents, so the null state cannot be represented at all.
+    input_error: ?Wrapped(InputError) = null, // ?Error behaves weirdly - `null` seems to be equal to whatever error number 0 represents, so the null state cannot be represented at all.
     returned_line: []const u8,
     cursor: usize = 0,
     drawn_cursor: usize = 0,
@@ -1195,7 +1097,7 @@ pub const Editor = struct {
             loop_queue: Queue(LoopExitCode),
             deferred_action_queue: Queue(DeferredAction),
             signal_queue: Queue(Signal),
-            input_error: ?Wrapped(Error) = null,
+            input_error: ?Wrapped(InputError) = null,
 
             pub fn init(allocator: Allocator, configuration: Configuration) Loop {
                 return .{
@@ -1274,7 +1176,7 @@ pub const Editor = struct {
             fn controlThreadMain(self: *Loop) void {
                 defer self.control_thread_exited = true;
 
-                const stdin = SystemCapabilities.getStdIn();
+                const stdin = SystemCapabilities.stdin();
 
                 std.debug.assert(self.thread_kill_pipe != null);
 
@@ -1306,7 +1208,7 @@ pub const Editor = struct {
                                 .INTR => {
                                     continue;
                                 },
-                                .NOMEM => toWrapped(Error, error.SystemResource),
+                                .NOMEM => toWrapped(InputError, error.SystemResource),
                                 else => {
                                     unreachable;
                                 },
@@ -1329,8 +1231,11 @@ pub const Editor = struct {
                     if (!is_windows) {
                         if (pollfds[2].revents & SystemCapabilities.POLL_IN != 0) no_read: {
                             // A signal! Let's handle it.
-                            var f: std.fs.File = .{ .handle = signalHandlingData.?.pipe.read };
-                            const signo = f.reader().readInt(i32, .little) catch {
+                            var file: std.fs.File = .{ .handle = signalHandlingData.?.pipe.read };
+                            var buffer: [4]u8 = undefined;
+                            var file_reader = file.reader(&buffer);
+                            const reader = &file_reader.interface;
+                            const signo = reader.takeInt(i32, .little) catch {
                                 break :no_read;
                             };
                             switch (signo) {
@@ -1459,22 +1364,34 @@ pub const Editor = struct {
         self.termios = t;
     }
 
+    pub const AddToHistoryError = std.mem.Allocator.Error;
+
     pub fn addToHistory(self: *Self, line: []const u8) !void {
         const entry: HistoryEntry = try .init(self.allocator, line);
         try self.history.container.append(entry);
     }
 
-    pub fn loadHistory(self: *Self, path: []const u8) !void {
+    pub const LoadHistoryError =
+        std.mem.Allocator.Error ||
+        std.fs.File.OpenError ||
+        std.fs.File.ReadError;
+
+    pub fn loadHistory(self: *Self, path: []const u8) LoadHistoryError!void {
         var history_file = std.fs.cwd().openFile(path, .{}) catch |err| switch (err) {
-            error.FileNotFound => {
-                return;
-            },
-            else => {
-                return err;
-            },
+            error.FileNotFound => return,
+            else => return err,
         };
         defer history_file.close();
-        const data = try history_file.reader().readAllAlloc(self.allocator, std.math.maxInt(usize));
+
+        var buffer: [1024]u8 = undefined;
+        var history_file_reader = history_file.reader(&buffer);
+        const reader = &history_file_reader.interface;
+
+        const data = reader.allocRemaining(self.allocator, .unlimited) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.ReadFailed => return history_file_reader.err.?,
+            error.StreamTooLong => unreachable,
+        };
         defer self.allocator.free(data);
         var it = std.mem.splitSequence(u8, data, "\n\n");
         while (it.next()) |str| {
@@ -1493,13 +1410,26 @@ pub const Editor = struct {
         }
     }
 
-    pub fn saveHistory(self: *Self, path: []const u8) !void {
+    pub const SaveHistoryError =
+        std.fs.File.OpenError ||
+        std.fs.File.WriteError;
+
+    pub fn saveHistory(self: *Self, path: []const u8) SaveHistoryError!void {
         var history_file = try std.fs.cwd().createFile(path, .{});
         defer history_file.close();
-        var writer = history_file.writer();
+
+        var buffer: [1024]u8 = undefined;
+        var history_file_writer = history_file.writer(&buffer);
+        const writer = &history_file_writer.interface;
+
         for (self.history.container.items) |entry| {
-            try writer.print("{}::{s}\n\n", .{ entry.timestamp, entry.entry });
+            writer.print("{d}::{s}\n\n", .{ entry.timestamp, entry.entry }) catch {
+                return history_file_writer.err.?;
+            };
         }
+        writer.flush() catch {
+            return history_file_writer.err.?;
+        };
     }
 
     fn addingStyleWouldDamageDrawnSpans(self: *Self, start: usize, end: usize) bool {
@@ -1577,37 +1507,54 @@ pub const Editor = struct {
     }
 
     fn getLineNonInteractive(self: *Self, prompt: []const u8) ![]const u8 {
-        _ = try SystemCapabilities.getStdErr().write(prompt);
+        var stderr_writer = SystemCapabilities.stderr().writer(&.{});
+        var stderr = &stderr_writer.interface;
+        try stderr.writeAll(prompt);
 
-        var array: ArrayList(u8) = .init(self.allocator);
-        defer array.deinit();
+        var stdin_buffer: [1024]u8 = undefined;
+        var stdin_reader = SystemCapabilities.stdin().reader(&stdin_buffer);
+        const stdin = &stdin_reader.interface;
 
-        streamUntilEol(SystemCapabilities.getStdIn().reader(), array.container.writer()) catch |e| switch (e) {
+        var allocating_writer: std.Io.Writer.Allocating = .init(self.allocator);
+        defer allocating_writer.deinit();
+        const writer = &allocating_writer.writer;
+
+        streamUntilEol(stdin, writer) catch |e| switch (e) {
             error.EndOfStream => return error.Eof,
             else => return e,
         };
 
-        return array.container.toOwnedSlice();
+        return allocating_writer.toOwnedSlice();
     }
 
-    fn streamUntilEol(reader: anytype, writer: anytype) !void {
+    fn streamUntilEol(reader: *std.Io.Reader, writer: *std.Io.Writer) !void {
         if (!is_windows) {
-            // eol is '\n', so we can just use streamUntilDelimiter.
-            return reader.streamUntilDelimiter(writer, '\n', null);
+            // eol is '\n', so we can just use streamDelimiter.
+            _ = try reader.streamDelimiter(writer, '\n');
+            return;
         }
 
         // Read until '\r', return if '\n' follows, otherwise keep reading.
         while (true) {
-            try reader.streamUntilDelimiter(writer, '\r', null);
-            const byte = try reader.readByte();
-            if (byte == '\n')
-                return;
-            try writer.writeByte('\r');
-            try writer.writeByte(byte);
+            _ = try reader.streamDelimiter(writer, '\r');
+            const bytes = try reader.peekArray(2);
+            std.debug.assert(bytes[0] == '\r');
+            if (bytes[1] == '\n') return;
         }
     }
 
-    pub fn getLine(self: *Self, prompt: []const u8) ![]const u8 {
+    pub const GetLineError =
+        InputError ||
+        std.Io.Reader.Error ||
+        std.Io.Writer.Error ||
+        std.mem.Allocator.Error ||
+        std.posix.PipeError ||
+        std.posix.TermiosGetError ||
+        std.posix.TermiosSetError ||
+        std.Thread.SpawnError ||
+        error{ CodepointTooLarge, Utf8CannotEncodeSurrogateHalf };
+
+    pub fn getLine(self: *Self, prompt: []const u8) GetLineError![]const u8 {
         if (self.configuration.operation_mode == .non_interactive) {
             // Disable all the fancy stuff, use a plain read.
             return self.getLineNonInteractive(prompt);
@@ -1629,16 +1576,13 @@ pub const Editor = struct {
 
                     signalHandlingData.?.old_sigint = @as(SystemCapabilities.Sigaction, undefined);
                     signalHandlingData.?.old_sigwinch = @as(SystemCapabilities.Sigaction, undefined);
-                    std.posix.sigaction(
-                        std.posix.SIG.INT,
-                        &.{ .handler = .{ .handler = @TypeOf(signalHandlingData.?).handleSignal }, .mask = std.posix.empty_sigset, .flags = 0 },
-                        &signalHandlingData.?.old_sigint.?,
-                    );
-                    std.posix.sigaction(
-                        std.posix.SIG.WINCH,
-                        &.{ .handler = .{ .handler = @TypeOf(signalHandlingData.?).handleSignal }, .mask = std.posix.empty_sigset, .flags = 0 },
-                        &signalHandlingData.?.old_sigwinch.?,
-                    );
+                    var act: std.posix.Sigaction = .{
+                        .handler = .{ .handler = @TypeOf(signalHandlingData.?).handleSignal },
+                        .mask = std.posix.sigemptyset(),
+                        .flags = 0,
+                    };
+                    std.posix.sigaction(std.posix.SIG.INT, &act, &signalHandlingData.?.old_sigint.?);
+                    std.posix.sigaction(std.posix.SIG.WINCH, &act, &signalHandlingData.?.old_sigwinch.?);
                 }
             }
         }
@@ -1651,7 +1595,8 @@ pub const Editor = struct {
             const old_lines = self.num_lines;
             self.getTerminalSize();
 
-            var stderr = SystemCapabilities.getStdErr();
+            var stderr_writer = SystemCapabilities.stderr().writer(&.{});
+            const stderr = &stderr_writer.interface;
 
             if (self.configuration.enable_bracketed_paste) {
                 try stderr.writeAll("\x1b[?2004h");
@@ -1722,7 +1667,7 @@ pub const Editor = struct {
                 }) catch |e| switch (e) {
                     error.ZiglineEventLoopExit, error.ZiglineEventLoopRetry => .{ .e = toWrapped(Loop.HandleResult.Error, e) },
                     else => b: {
-                        self.input_error = toWrapped(Error, e);
+                        self.input_error = toWrapped(InputError, e);
                         break :b .{ .e = null };
                     },
                 };
@@ -1765,7 +1710,7 @@ pub const Editor = struct {
         self.initialized = true;
     }
 
-    pub fn interrupted(self: *Self) Error!bool {
+    fn interrupted(self: *Self) !bool {
         if (self.is_searching) {
             return self.search_editor.?.interrupted();
         }
@@ -1774,18 +1719,25 @@ pub const Editor = struct {
             return false;
         }
 
-        _ = SystemCapabilities.getStdErr().write("^C") catch 0;
+        {
+            var stderr_writer = SystemCapabilities.stderr().writer(&.{});
+            const stderr = &stderr_writer.interface;
+            try stderr.writeAll("^C");
+        }
 
         self.buffer.container.clearAndFree();
         self.chars_touched_in_the_middle = 0;
         self.cursor = 0;
 
         {
-            var stream = std.io.bufferedWriter(SystemCapabilities.getStdErr().writer());
-            try self.repositionCursor(&stream, true);
+            var stderr_buffer: [1024]u8 = undefined;
+            var stderr_writer = SystemCapabilities.stderr().writer(&stderr_buffer);
+            const stderr = &stderr_writer.interface;
+
+            try self.repositionCursor(stderr, true);
             // FIXME: Suggestion display cleanup.
-            _ = try stream.write("\n");
-            try stream.flush();
+            try stderr.writeAll("\n");
+            try stderr.flush();
         }
 
         self.was_interrupted = true;
@@ -1799,7 +1751,7 @@ pub const Editor = struct {
         return false;
     }
 
-    pub fn resized(self: *Self) Error!void {
+    fn resized(self: *Self) !void {
         self.was_resized = true;
         self.previous_num_columns = self.num_columns;
         self.getTerminalSize();
@@ -1836,7 +1788,7 @@ pub const Editor = struct {
     }
 
     pub fn getBufferedLineUpTo(self: *Self, index: usize) ![]const u8 {
-        var u8buffer: std.ArrayList(u8) = .init(self.allocator);
+        var u8buffer: std.array_list.Managed(u8) = .init(self.allocator);
         defer u8buffer.deinit();
 
         for (self.buffer.container.items[0..index]) |code_point| {
@@ -1971,7 +1923,9 @@ pub const Editor = struct {
 
     pub fn clearLine(self: *Self) void {
         _ = self;
-        _ = SystemCapabilities.getStdErr().write("\r\x1b[K") catch unreachable;
+        var stderr_writer = SystemCapabilities.stderr().writer(&.{});
+        const stderr = &stderr_writer.interface;
+        stderr.writeAll("\r\x1b[K") catch {};
     }
 
     pub fn insertString(self: *Self, string: []const u8) void {
@@ -2025,7 +1979,7 @@ pub const Editor = struct {
         self.prohibit_input_processing = false;
     }
 
-    fn eatErrors(comptime f: fn (*Self) Error!bool) fn (*Self) bool {
+    fn eatErrors(comptime f: fn (*Self) anyerror!bool) fn (*Self) bool {
         return struct {
             pub fn handler(self: *Self) bool {
                 return f(self) catch false;
@@ -2093,7 +2047,7 @@ pub const Editor = struct {
         try self.callback_machine.registerKeyInputCallback(&.{.{ .code_point = c }}, f);
     }
 
-    fn vtApplyStyle(self: *Self, style: Style, output_stream: anytype, is_starting: bool) !void {
+    fn vtApplyStyle(self: *Self, style: Style, writer: *std.Io.Writer, is_starting: bool) !void {
         _ = self;
 
         var buffer: [128]u8 = undefined;
@@ -2106,7 +2060,7 @@ pub const Editor = struct {
             const fg = try style.foreground.toVTEscape(allocator, .foreground);
             defer allocator.free(fg);
 
-            try output_stream.writer().print("\x1b[{};{};{}m{s}{s}", .{
+            try writer.print("\x1b[{d};{d};{d}m{s}{s}", .{
                 @as(u8, if (style.bold) 1 else 22),
                 @as(u8, if (style.underline) 4 else 24),
                 @as(u8, if (style.italic) 3 else 23),
@@ -2116,23 +2070,22 @@ pub const Editor = struct {
         }
     }
 
-    fn vtMoveAbsolute(self: *Self, row: usize, col: usize, output_stream: anytype) !void {
+    fn vtMoveAbsolute(self: *Self, row: usize, col: usize, writer: *std.Io.Writer) !void {
         _ = self;
-        _ = try output_stream.writer().print("\x1b[{d};{d}H", .{ row, col });
+        _ = try writer.print("\x1b[{d};{d}H", .{ row, col });
     }
 
-    fn vtClearToEndOfLine(self: *Self, output_stream: anytype) !void {
+    fn vtClearToEndOfLine(self: *Self, writer: *std.Io.Writer) !void {
         _ = self;
-        _ = try output_stream.write("\x1b[K");
+        _ = try writer.writeAll("\x1b[K");
     }
 
-    fn vtClearLines(self: *Self, above: usize, below: usize, output_stream: anytype) !void {
+    fn vtClearLines(self: *Self, above: usize, below: usize, writer: *std.Io.Writer) !void {
         if (above + below == 0) {
             return self.clearLine();
         }
 
         // Go down below lines...
-        var writer = output_stream.writer();
         if (below > 0) {
             try writer.print("\x1b[{d}B", .{below});
         }
@@ -2181,18 +2134,18 @@ pub const Editor = struct {
 
         var keybuf: [32]u8 = @splat(0);
 
-        var stdin = SystemCapabilities.getStdIn();
+        var stdin = SystemCapabilities.stdin();
 
         if (self.incomplete_data.container.items.len == 0) {
             const nread = stdin.read(&keybuf) catch |err| {
                 // Zig eats EINTR, so we'll have to delay resize handling until the next read.
                 self.finished = true;
-                self.input_error = toWrapped(Error, err);
+                self.input_error = toWrapped(InputError, err);
                 return;
             };
 
             if (nread == 0) {
-                self.input_error = toWrapped(Error, error.Empty);
+                self.input_error = toWrapped(InputError, error.Empty);
                 self.finished = true;
                 return;
             }
@@ -2220,8 +2173,8 @@ pub const Editor = struct {
 
         // FIXME: These are leaked, we have no way to free them.
         const csi = struct {
-            var parameter_bytes: std.ArrayList(u8) = undefined;
-            var intermediate_bytes: std.ArrayList(u8) = undefined;
+            var parameter_bytes: std.array_list.Managed(u8) = undefined;
+            var intermediate_bytes: std.array_list.Managed(u8) = undefined;
             var initialized = false;
         };
 
@@ -2231,7 +2184,7 @@ pub const Editor = struct {
             csi.initialized = true;
         }
 
-        var csi_parameters: std.ArrayList(u32) = .init(self.allocator);
+        var csi_parameters: std.array_list.Managed(u32) = .init(self.allocator);
         defer csi_parameters.deinit();
 
         var csi_final: u8 = 0;
@@ -2400,7 +2353,7 @@ pub const Editor = struct {
                                         continue;
                                     }
                                 }
-                                logger.debug("Unhandled '~': {}", .{param1});
+                                logger.debug("Unhandled '~': {d}", .{param1});
                                 continue;
                             },
                             else => {
@@ -2500,7 +2453,7 @@ pub const Editor = struct {
         }
     }
 
-    fn handleResizeEvent(self: *Self, reset_origin: bool) !void {
+    fn handleResizeEvent(self: *Self, reset_origin: bool) InputError!void {
         self.has_origin_reset_scheduled = false;
         if (reset_origin and !self.setOrigin(false)) {
             self.has_origin_reset_scheduled = true;
@@ -2511,13 +2464,15 @@ pub const Editor = struct {
         self.setOriginValues(self.origin_row, 1);
 
         {
-            var stream = std.io.bufferedWriter(SystemCapabilities.getStdErr().writer());
+            var stderr_buffer: [1024]u8 = undefined;
+            var stderr_writer = SystemCapabilities.stderr().writer(&stderr_buffer);
+            const stderr = &stderr_writer.interface;
 
-            try self.repositionCursor(&stream, true);
+            try self.repositionCursor(stderr, true);
             // FIXME: suggestion_display.redisplay();
-            try self.repositionCursor(&stream, false);
+            try self.repositionCursor(stderr, false);
 
-            try stream.flush();
+            try stderr.flush();
         }
 
         if (self.is_searching) {
@@ -2531,10 +2486,10 @@ pub const Editor = struct {
     }
 
     fn vtDSR(self: *Self) ![2]usize {
-        var buf: [32]u8 = @splat(0);
+        var buf: [32]u8 = undefined;
         var more_junk_to_read = false;
-        var stdin = SystemCapabilities.getStdIn();
-        var pollfds: [1]SystemCapabilities.pollfd = @splat(undefined);
+        var stdin = SystemCapabilities.stdin();
+        var pollfds: [1]SystemCapabilities.pollfd = undefined;
         {
             var pollfd: SystemCapabilities.pollfd = undefined;
             SystemCapabilities.setPollFd(&pollfd, stdin.handle);
@@ -2549,7 +2504,7 @@ pub const Editor = struct {
             if (rc == 1 and pollfds[0].revents & SystemCapabilities.POLL_IN != 0) {
                 const nread = stdin.read(&buf) catch |err| {
                     self.finished = true;
-                    self.input_error = toWrapped(Error, err);
+                    self.input_error = toWrapped(InputError, err);
                     return error.ReadFailure;
                 };
                 if (nread == 0) {
@@ -2567,8 +2522,9 @@ pub const Editor = struct {
             return fromWrapped(err);
         }
 
-        var stderr = SystemCapabilities.getStdErr();
-        _ = try stderr.write("\x1b[6n");
+        var stderr_writer = SystemCapabilities.stderr().writer(&.{});
+        const stderr = &stderr_writer.interface;
+        try stderr.writeAll("\x1b[6n");
 
         var state: enum {
             free,
@@ -2742,7 +2698,9 @@ pub const Editor = struct {
             }
 
             if (!found) {
-                _ = SystemCapabilities.getStdErr().write("\x07") catch 0;
+                var stderr_writer = SystemCapabilities.stderr().writer(&.{});
+                const stderr = &stderr_writer.interface;
+                stderr.writeAll("\x07") catch {};
             }
         }
 
@@ -2805,10 +2763,12 @@ pub const Editor = struct {
             return;
         }
 
-        var buffered_output = std.io.bufferedWriter(SystemCapabilities.getStdErr().writer());
+        var stderr_buffer: [1024]u8 = undefined;
+        var stderr_writer = SystemCapabilities.stderr().writer(&stderr_buffer);
+        const stderr = &stderr_writer.interface;
         defer {
             self.shown_lines = self.currentPromptMetrics().linesWithAddition(self.cached_buffer_metrics, self.num_columns);
-            _ = buffered_output.flush() catch {};
+            stderr.flush() catch {};
         }
 
         const has_cleaned_up = false;
@@ -2836,21 +2796,21 @@ pub const Editor = struct {
         if (self.origin_row + current_num_lines > self.num_lines) {
             if (current_num_lines > self.num_lines) {
                 for (0..self.num_lines) |_| {
-                    _ = try buffered_output.write("\n");
+                    try stderr.writeAll("\n");
                 }
                 self.origin_row = 0;
             } else {
                 const old_origin_row = self.origin_row;
                 self.origin_row = self.num_lines - current_num_lines + 1;
                 for (0..old_origin_row - self.origin_row) |_| {
-                    _ = try buffered_output.write("\n");
+                    try stderr.writeAll("\n");
                 }
             }
         }
 
         // Do not call hook on pure cursor movements.
         if (self.cached_prompt_valid and !self.refresh_needed and self.pending_chars.container.items.len == 0) {
-            try self.repositionCursor(&buffered_output, false);
+            try self.repositionCursor(stderr, false);
             self.cached_buffer_metrics.deinit();
             self.cached_buffer_metrics = try self.actualRenderedUnicodeStringMetrics(self.buffer.container.items);
             self.drawn_end_of_line_offset = self.buffer.size();
@@ -2869,10 +2829,10 @@ pub const Editor = struct {
                 // Just write the characters out and continue,
                 // no need to refresh anything else.
                 for (self.drawn_cursor..self.buffer.size()) |i| {
-                    try self.applyStyles(&empty_styles, &buffered_output, i);
-                    try self.printCharacterAt(i, &buffered_output);
+                    try self.applyStyles(&empty_styles, stderr, i);
+                    try self.printCharacterAt(i, stderr);
                 }
-                try self.vtApplyStyle(.reset, &buffered_output, true);
+                try self.vtApplyStyle(.reset, stderr, true);
                 self.pending_chars.container.clearAndFree();
                 self.drawn_cursor = self.cursor;
                 self.drawn_end_of_line_offset = self.buffer.size();
@@ -2887,18 +2847,18 @@ pub const Editor = struct {
             try self.cleanup();
         }
 
-        try self.vtMoveAbsolute(self.origin_row, self.origin_column, &buffered_output);
+        try self.vtMoveAbsolute(self.origin_row, self.origin_column, stderr);
 
-        _ = try buffered_output.write(self.new_prompt.container.items);
+        try stderr.writeAll(self.new_prompt.container.items);
 
-        try self.vtClearToEndOfLine(&buffered_output);
+        try self.vtClearToEndOfLine(stderr);
 
         for (0..self.buffer.size()) |i| {
-            try self.applyStyles(&empty_styles, &buffered_output, i);
-            try self.printCharacterAt(i, &buffered_output);
+            try self.applyStyles(&empty_styles, stderr, i);
+            try self.printCharacterAt(i, stderr);
         }
 
-        try self.vtApplyStyle(.reset, &buffered_output, true);
+        try self.vtApplyStyle(.reset, stderr, true);
 
         self.pending_chars.container.clearAndFree();
         self.refresh_needed = false;
@@ -2908,7 +2868,7 @@ pub const Editor = struct {
         self.drawn_end_of_line_offset = self.buffer.size();
         self.cached_prompt_valid = true;
 
-        try self.repositionCursor(&buffered_output, false);
+        try self.repositionCursor(stderr, false);
     }
 
     pub fn setHandler(self: *Self, handler: anytype) void {
@@ -2928,7 +2888,7 @@ pub const Editor = struct {
         }
     }
 
-    fn applyStyles(self: *Self, empty_styles: *AutoHashMap(usize, Style), output_stream: anytype, index: usize) !void {
+    fn applyStyles(self: *Self, empty_styles: *AutoHashMap(usize, Style), writer: *std.Io.Writer, index: usize) !void {
         const HM = AutoHashMap(usize, AutoHashMap(usize, Style));
         var ends = (self.current_spans.ending.container.getEntry(index) orelse HM.Entry{
             .value_ptr = empty_styles,
@@ -2949,11 +2909,11 @@ pub const Editor = struct {
             }
 
             // Disable any style that should be turned off.
-            try self.vtApplyStyle(style, output_stream, false);
+            try self.vtApplyStyle(style, writer, false);
 
             // Reapply styles for overlapping spans that include this one.
             style = self.findApplicableStyle(index);
-            try self.vtApplyStyle(style, output_stream, true);
+            try self.vtApplyStyle(style, writer, true);
         }
 
         if (starts.container.count() > 0) {
@@ -2964,16 +2924,16 @@ pub const Editor = struct {
             }
 
             // Set new styles.
-            try self.vtApplyStyle(style, output_stream, true);
+            try self.vtApplyStyle(style, writer, true);
         }
     }
 
-    fn printCharacterAt(self: *Self, index: usize, output_stream: anytype) !void {
-        return self.printSingleCharacter(self.buffer.container.items[index], output_stream);
+    fn printCharacterAt(self: *Self, index: usize, writer: *std.Io.Writer) !void {
+        return self.printSingleCharacter(self.buffer.container.items[index], writer);
     }
 
-    fn printSingleCharacter(self: *Self, code_point: u32, output_stream: anytype) !void {
-        var buffer: std.ArrayList(u8) = .init(self.allocator);
+    fn printSingleCharacter(self: *Self, code_point: u32, writer: *std.Io.Writer) !void {
+        var buffer: std.array_list.Managed(u8) = .init(self.allocator);
         defer buffer.deinit();
 
         const should_print_masked = isAsciiControl(code_point) and code_point != '\n';
@@ -2988,7 +2948,7 @@ pub const Editor = struct {
             _ = try std.unicode.utf8Encode(c, buffer.items[buffer.items.len - length .. buffer.items.len]);
         }
 
-        _ = try output_stream.write(buffer.items);
+        try writer.writeAll(buffer.items);
     }
 
     fn cleanup(self: *Self) !void {
@@ -3001,12 +2961,13 @@ pub const Editor = struct {
             self.extra_forward_lines = @max(shown_lines - new_lines, self.extra_forward_lines);
         }
 
-        var stderr = SystemCapabilities.getStdErr();
-        try self.repositionCursor(&stderr, true);
+        var stderr_writer = SystemCapabilities.stderr().writer(&.{});
+        const stderr = &stderr_writer.interface;
+        try self.repositionCursor(stderr, true);
         const current_line = self.numLines();
-        try self.vtClearLines(current_line, self.extra_forward_lines, &stderr);
+        try self.vtClearLines(current_line, self.extra_forward_lines, stderr);
         self.extra_forward_lines = 0;
-        try self.repositionCursor(&stderr, false);
+        try self.repositionCursor(stderr, false);
     }
 
     fn cleanupSuggestions(self: *Self) !void {
@@ -3015,10 +2976,10 @@ pub const Editor = struct {
 
     fn reallyQuitEventLoop(self: *Self) !void {
         self.finished = false;
-        var stderr = SystemCapabilities.getStdErr();
-        var stream = stderr.writer();
-        try self.repositionCursor(&stderr, true);
-        _ = try stream.write("\n");
+        var stderr_writer = SystemCapabilities.stderr().writer(&.{});
+        const stderr = &stderr_writer.interface;
+        try self.repositionCursor(stderr, true);
+        try stderr.writeAll("\n");
 
         const str = try self.getBufferedLine();
         self.buffer.container.clearAndFree();
@@ -3039,7 +3000,8 @@ pub const Editor = struct {
         try setTermios(self.default_termios);
         self.initialized = false;
         if (self.configuration.enable_bracketed_paste) {
-            var stderr = SystemCapabilities.getStdErr();
+            var stderr_writer = SystemCapabilities.stderr().writer(&.{});
+            const stderr = &stderr_writer.interface;
             try stderr.writeAll("\x1b[?2004l");
         }
     }
@@ -3079,7 +3041,7 @@ pub const Editor = struct {
     fn setOrigin(self: *Self, quit_on_error: bool) bool {
         const position = self.vtDSR() catch |err| {
             if (quit_on_error) {
-                self.input_error = toWrapped(Error, err);
+                self.input_error = toWrapped(InputError, err);
                 _ = self.finish();
             }
             return false;
@@ -3101,7 +3063,7 @@ pub const Editor = struct {
         _ = self;
     }
 
-    fn repositionCursor(self: *Self, output_stream: anytype, to_end: bool) !void {
+    fn repositionCursor(self: *Self, writer: *std.Io.Writer, to_end: bool) !void {
         var cursor = self.cursor;
         const saved_cursor = cursor;
         if (to_end) {
@@ -3116,7 +3078,7 @@ pub const Editor = struct {
 
         self.ensureFreeLinesFromOrigin(line);
 
-        try self.vtMoveAbsolute(line + self.origin_row, column + self.origin_column, output_stream);
+        try self.vtMoveAbsolute(line + self.origin_row, column + self.origin_column, writer);
 
         self.cursor = saved_cursor;
     }
@@ -3145,7 +3107,7 @@ pub const Editor = struct {
         self.num_columns = 80;
         self.num_lines = 24;
         if (!is_windows) {
-            const ws = SystemCapabilities.getWinsize(SystemCapabilities.getStdIn().handle) catch {
+            const ws = SystemCapabilities.getWinsize(SystemCapabilities.stdin().handle) catch {
                 return;
             };
             self.num_columns = ws.col;
@@ -3168,10 +3130,11 @@ pub const Editor = struct {
     }
 
     pub fn clearScreen(self: *Self) bool {
-        var stderr = SystemCapabilities.getStdErr();
-        _ = stderr.write("\x1b[3J\x1b[H\x1b[2J") catch 0;
+        var stderr_writer = SystemCapabilities.stderr().writer(&.{});
+        const stderr = &stderr_writer.interface;
+        stderr.writeAll("\x1b[3J\x1b[H\x1b[2J") catch {};
 
-        self.vtMoveAbsolute(1, 1, &stderr) catch {};
+        self.vtMoveAbsolute(1, 1, stderr) catch {};
         self.setOriginValues(1, 1);
         self.refresh_needed = true;
         self.cached_prompt_valid = false;
@@ -3184,7 +3147,9 @@ pub const Editor = struct {
         }
 
         if (self.cursor == 0) {
-            _ = SystemCapabilities.getStdErr().write("\x07") catch 0; // \a BEL
+            var stderr_writer = SystemCapabilities.stderr().writer(&.{});
+            const stderr = &stderr_writer.interface;
+            stderr.writeAll("\x07") catch {}; // \a BEL
             return false;
         }
 
@@ -3201,7 +3166,9 @@ pub const Editor = struct {
         }
 
         if (self.cursor == self.buffer.size()) {
-            _ = SystemCapabilities.getStdErr().write("\x07") catch 0; // \a BEL
+            var stderr_writer = SystemCapabilities.stderr().writer(&.{});
+            const stderr = &stderr_writer.interface;
+            stderr.writeAll("\x07") catch {}; // \a BEL
             return false;
         }
 
@@ -3300,9 +3267,11 @@ pub const Editor = struct {
         self.prohibitInput();
         defer self.allowInput();
 
-        _ = SystemCapabilities.getStdErr().write("<EOF>\n") catch 0;
+        var stderr_writer = SystemCapabilities.stderr().writer(&.{});
+        const stderr = &stderr_writer.interface;
+        stderr.writeAll("<EOF>\n") catch {};
         if (!self.always_refresh) {
-            self.input_error = toWrapped(Error, error.Eof);
+            self.input_error = toWrapped(InputError, error.Eof);
             _ = self.finish();
             self.reallyQuitEventLoop() catch {};
         }

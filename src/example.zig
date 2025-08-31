@@ -1,21 +1,37 @@
 const Editor = @import("main.zig").Editor;
+const uefi = @import("uefi.zig");
 const std = @import("std");
 const builtin = @import("builtin");
 
+pub const std_options: std.Options = switch (builtin.os.tag) {
+    .uefi => .{
+        // std.log does not work on UEFI (yet)
+        .logFn = struct {
+            fn logFn(
+                comptime _: std.log.Level,
+                comptime _: @TypeOf(.enum_literal),
+                comptime _: []const u8,
+                _: anytype,
+            ) void {}
+        }.logFn,
+    },
+    else => .{},
+};
+
 pub fn main() void {
     switch (builtin.os.tag) {
-        .uefi => main_uefi(std.os.uefi.pool_allocator),
+        .uefi => main_uefi(std.os.uefi.pool_allocator) catch {},
         else => {
-            var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-            defer _ = gpa.deinit();
-            main_generic(gpa.allocator()) catch |err| {
-                std.debug.print("Error: {}\n", .{err});
+            var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
+            defer _ = debug_allocator.deinit();
+            main_generic(debug_allocator.allocator()) catch |err| {
+                std.debug.print("Error: {t}\n", .{err});
             };
         },
     }
 }
 
-fn main_generic(allocator: std.mem.Allocator) Editor.Error!void {
+fn main_generic(allocator: std.mem.Allocator) !void {
     var editor = Editor.init(allocator, .{});
     defer editor.deinit();
 
@@ -35,7 +51,7 @@ fn main_generic(allocator: std.mem.Allocator) Editor.Error!void {
                         .end = i + 1,
                     }, .{
                         .foreground = .{
-                            .rgb = [3]u8{ 255, 0, 0 },
+                            .rgb = .{ 255, 0, 0 },
                         },
                     }) catch unreachable;
                 } else {
@@ -44,7 +60,7 @@ fn main_generic(allocator: std.mem.Allocator) Editor.Error!void {
                         .end = i + 1,
                     }, .{
                         .foreground = .{
-                            .rgb = [3]u8{
+                            .rgb = .{
                                 @intCast(c % 26 * 10),
                                 @intCast(c / 26 * 10),
                                 @intCast(c % 10 * 10 + 150),
@@ -71,7 +87,7 @@ fn main_generic(allocator: std.mem.Allocator) Editor.Error!void {
         defer allocator.free(line);
 
         try editor.addToHistory(line);
-        std.log.info("line ({} bytes): {s}\n", .{ line.len, line });
+        std.log.info("line ({d} bytes): {s}\n", .{ line.len, line });
 
         if (std.mem.eql(u8, line, "quit")) {
             break;
@@ -79,52 +95,30 @@ fn main_generic(allocator: std.mem.Allocator) Editor.Error!void {
     }
 }
 
-const WriterContext = struct {
-    console_out: *std.os.uefi.protocol.SimpleTextOutput,
-    attribute: usize,
-};
-
-fn writeFn(context: *const anyopaque, bytes: []const u8) anyerror!usize {
-    const writer_context: *const WriterContext = @alignCast(@ptrCast(context));
-    const console_out = writer_context.console_out;
-    _ = console_out.setAttribute(writer_context.attribute);
-    for (bytes) |c| {
-        if (c == '\n') {
-            _ = console_out.outputString(@ptrCast(&[2]u16{ '\r', 0 }));
-        }
-        _ = console_out.outputString(@ptrCast(&[2]u16{ c, 0 }));
-    }
-    return bytes.len;
-}
-
-fn main_uefi(allocator: std.mem.Allocator) void {
+fn main_uefi(allocator: std.mem.Allocator) !void {
     var editor = Editor.init(allocator, .{});
     defer editor.deinit();
 
-    // kiesel: src/branch/main/src/uefi.zig:69
+    // kiesel: src/branch/main/src/uefi.zig
     const console_out = std.os.uefi.system_table.con_out.?;
-    _ = console_out.reset(true);
-    _ = console_out.clearScreen();
+    try console_out.reset(true);
+    try console_out.clearScreen();
+    try console_out.enableCursor(true);
 
-    const stdout: std.io.AnyWriter = .{
-        .context = &WriterContext{
-            .console_out = console_out,
-            .attribute = 0x7, // white
-        },
-        .writeFn = writeFn,
-    };
+    var stdout_buffer: [1024]u8 = undefined;
+    var stdout_writer: uefi.Writer = .init(&stdout_buffer, console_out, .{ .foreground = .white });
+    const stdout = &stdout_writer.interface;
 
     while (true) {
         const line: []const u8 = editor.getLine("> ") catch |err| switch (err) {
             error.Eof => break,
-            else => return,
+            else => return err,
         };
         defer allocator.free(line);
 
-        editor.addToHistory(line) catch {
-            stdout.print("Failed to add line to history\n", .{}) catch {};
-        };
-        stdout.print("line ({} bytes): {s}\n", .{ line.len, line }) catch {};
+        try editor.addToHistory(line);
+        try stdout.print("line ({d} bytes): {s}\n", .{ line.len, line });
+        try stdout.flush();
 
         if (std.mem.eql(u8, line, "quit")) {
             break;
