@@ -31,7 +31,7 @@ fn DeinitingAutoHashMap(comptime K: type, comptime V: type, comptime deinit_key:
 
 fn DeinitingArrayList(comptime T: type, comptime deinit_fn: anytype) type {
     return struct {
-        container: std.ArrayList(T),
+        container: std.array_list.Managed(T),
 
         const Self = @This();
 
