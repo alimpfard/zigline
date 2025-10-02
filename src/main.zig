@@ -683,7 +683,7 @@ pub const SuggestionDisplay = struct {
             longest_suggestion_length = 0;
         }
 
-        try vtMoveAbsolute(self.prompt_lines_at_suggestion_initiation + self.origin_row - 1, 1);
+        try vtMoveAbsolute(self.prompt_lines_at_suggestion_initiation + self.origin_row - 1, 0);
 
         if (self.pages.size() == 0) {
             var printed: usize = 0;
