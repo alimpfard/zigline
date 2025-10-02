@@ -14,6 +14,4 @@ LibLine is a full-featured terminal line editor with support for:
 
 This port of LibLine is a work in progress, and as such, is incomplete. The following features are not yet implemented:
 - Masks
-- Terminal size detection; this is currently fixed at 24x80.
-- Autocomplete / suggestions
 - Many more small features
