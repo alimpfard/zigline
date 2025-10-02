@@ -20,6 +20,8 @@ const should_enable_signal_handling = switch (builtin.os.tag) {
 
 const logger = std.log.scoped(.zigline);
 
+const Module = @This();
+
 fn Wrapped(comptime T: type) type {
     return struct {
         value: std.meta.Int(.unsigned, @bitSizeOf(T)),
@@ -413,7 +415,18 @@ fn utf8ValidRange(s: []const u8) usize {
     return i;
 }
 
-pub const CompletionSuggestion = struct {};
+pub const CompletionSuggestion = struct {
+    text: []const u8,
+    trailing_trivia: []const u8 = "",
+    display_trivia: []const u8 = "",
+    style: Style = .{},
+    start_index: usize = 0,
+    input_offset: usize = 0,
+    static_offset: usize = 0,
+    invariant_offset: usize = 0,
+    allow_commit_without_listing: bool = true,
+};
+
 pub const Style = struct {
     underline: bool = false,
     bold: bool = false,
@@ -591,8 +604,356 @@ pub const StringMetrics = struct {
     }
 };
 
-pub const SuggestionDisplay = struct {};
-pub const SuggestionManager = struct {};
+pub const SuggestionDisplay = struct {
+    allocator: Allocator,
+    origin_row: usize = 0,
+    origin_column: usize = 0,
+    is_showing: bool = false,
+    lines: usize = 0,
+    columns: usize = 0,
+    lines_used_for_last_suggestion: usize = 0,
+    prompt_lines_at_suggestion_initiation: usize = 0,
+    pages: ArrayList(struct { start: usize, end: usize }),
+
+    const Self = @This();
+
+    pub fn init(allocator: Allocator) Self {
+        return .{ .allocator = allocator, .pages = .init(allocator) };
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.pages.deinit();
+    }
+
+    pub fn finish(self: *Self) void {
+        self.pages.container.clearAndFree();
+    }
+
+    pub fn cleanup(self: *Self) !bool {
+        self.is_showing = false;
+        if (self.lines_used_for_last_suggestion > 0) {
+            var stderr_writer = SystemCapabilities.stderr().writer(&.{});
+            const stderr = &stderr_writer.interface;
+            // Save cursor position
+            try stderr.print("\x1b7", .{});
+            // Move cursor to the beginning of the suggestion display
+            try stderr.print("\x1b[{d};{d}H", .{ self.origin_row + self.prompt_lines_at_suggestion_initiation, 1 });
+            // Clear the suggestion display
+            for (0..self.lines_used_for_last_suggestion) |_| {
+                try stderr.print("\x1b[2K\x1b[1E", .{});
+            }
+            // Restore cursor position
+            try stderr.print("\x1b8", .{});
+            self.is_showing = false;
+            return true;
+        }
+
+        return false;
+    }
+
+    pub fn display(self: *Self, manager: *SuggestionManager) !void {
+        self.is_showing = true;
+
+        var stderr_writer = SystemCapabilities.stderr().writer(&.{});
+        const stderr = &stderr_writer.interface;
+
+        var longest_suggestion_length: usize = 0;
+        var longest_suggestion_length_without_trivia: usize = 0;
+
+        for (manager.suggestions.container.items) |*s| {
+            longest_suggestion_length = @max(longest_suggestion_length, s.text.len + s.trailing_trivia.len);
+            longest_suggestion_length_without_trivia = @max(longest_suggestion_length_without_trivia, s.text.len);
+        }
+
+        var num_printed: usize = 0;
+        var lines_used: usize = 1;
+
+        _ = try self.cleanup();
+
+        var spans_entire_line: bool = false;
+        const max_line_count = self.prompt_lines_at_suggestion_initiation + longest_suggestion_length / self.columns + @intFromBool(longest_suggestion_length % self.columns != 0);
+        if (longest_suggestion_length >= self.columns - 2) {
+            spans_entire_line = true;
+            const start = max_line_count - self.prompt_lines_at_suggestion_initiation;
+            // "reserve" space for the lines used.
+            for (start..max_line_count) |_| {
+                try stderr.print("\n", .{});
+            }
+            lines_used += max_line_count;
+            longest_suggestion_length = 0;
+        }
+
+        try vtMoveAbsolute(self.prompt_lines_at_suggestion_initiation + self.origin_row - 1, 1);
+
+        if (self.pages.size() == 0) {
+            var printed: usize = 0;
+            var lines: usize = 1;
+            var page_start: usize = 0;
+            for (manager.suggestions.container.items, 0..) |*s, i| {
+                const next_column = printed + s.text.len + longest_suggestion_length + 2;
+                if (next_column > self.columns) {
+                    lines += (s.text.len + self.columns - 1) / self.columns;
+                    printed = 0;
+                }
+                if (lines + self.prompt_lines_at_suggestion_initiation > self.lines) {
+                    try self.pages.container.append(.{ .start = page_start, .end = i });
+                    page_start = i;
+                    lines = 1;
+                    printed = 0;
+                }
+                printed += if (spans_entire_line) self.columns else longest_suggestion_length + 2;
+            }
+
+            try self.pages.container.append(.{ .start = page_start, .end = manager.suggestions.size() });
+        }
+
+        const page_index = self.fit_to_page_boundary(manager.next_suggestion_index);
+        const page = &self.pages.container.items[page_index];
+        for (manager.suggestions.container.items[page.start..page.end], page.start..page.end) |*s, i| {
+            const next_column = num_printed + s.text.len + longest_suggestion_length + 2;
+            if (next_column > self.columns) {
+                lines_used += (s.text.len + self.columns - 1) / self.columns;
+                num_printed = 0;
+                try stderr.print("\n", .{});
+            }
+
+            if (manager.last_shown_suggestion_was_complete and i == manager.next_suggestion_index) {
+                try Editor.vtApplyStyle(.{ .foreground = .{ .xterm = .cyan } }, stderr, true);
+            }
+
+            if (spans_entire_line) {
+                num_printed += self.columns;
+                try stderr.print("{s}{s}", .{ s.text, s.display_trivia });
+            } else {
+                const spaces_alloc: [256]u8 = @splat(' ');
+                const spaces = spaces_alloc[0 .. longest_suggestion_length - s.text.len - s.trailing_trivia.len];
+                num_printed += longest_suggestion_length + 2;
+                try stderr.print("{s}{s}{s}  ", .{ s.text, spaces, s.display_trivia });
+            }
+
+            if (manager.last_shown_suggestion_was_complete and i == manager.next_suggestion_index) {
+                try Editor.vtApplyStyle(.reset, stderr, true);
+            }
+        }
+
+        self.lines_used_for_last_suggestion = lines_used;
+        lines_used += self.prompt_lines_at_suggestion_initiation - 1;
+
+        if (self.origin_row + lines_used > self.lines) {
+            self.origin_row = self.lines - lines_used;
+        }
+    }
+
+    fn fit_to_page_boundary(self: *Self, index: usize) usize {
+        for (self.pages.container.items, 0..) |*page, i| {
+            if (index >= page.start and index < page.end) {
+                return i;
+            }
+        }
+        return 0;
+    }
+};
+pub const SuggestionManager = struct {
+    allocator: Allocator,
+    suggestions: ArrayList(CompletionSuggestion),
+    last_shown_suggestion: CompletionSuggestion = .{ .text = "" },
+    last_shown_suggestion_display_length: usize = 0,
+    last_shown_suggestion_was_complete: bool = false,
+    next_suggestion_index: usize = 0,
+    largest_common_suggestion_prefix_length: usize = 0,
+    last_displayed_suggestion_index: usize = 0,
+    selected_suggestion_index: usize = 0,
+
+    const Self = @This();
+    pub const CompletionMode = enum(u8) {
+        @"don't_complete",
+        complete_prefix,
+        show_suggestions,
+        cycle_suggestions,
+    };
+
+    pub const CompletionAttemptResult = struct {
+        new_mode: CompletionMode,
+        new_cursor_offset: isize = 0,
+        // Region to remove: [start, end) translated by (old_cursor + new_cursor_offset).
+        offset_region_to_remove: struct { start: usize, end: usize } = .{ .start = 0, .end = 0 },
+        // Range to restore after rejection of this suggestion.
+        static_offset_from_cursor: usize = 0,
+        insert_storage: [8][]const u8 = @splat(undefined),
+        insert_count: usize = 0,
+        style_to_apply: ?Style = null,
+        avoid_committing_to_single_suggestion: bool = false,
+    };
+
+    pub fn init(allocator: Allocator) Self {
+        return .{
+            .allocator = allocator,
+            .suggestions = .init(allocator),
+        };
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.suggestions.deinit();
+    }
+
+    fn commonPrefixLength(comptime T: type, a: []const T, b: []const T) usize {
+        const min_len = @min(a.len, b.len);
+        var i: usize = 0;
+        while (i < min_len) : (i += 1) {
+            if (a[i] != b[i]) break;
+        }
+        return i;
+    }
+
+    pub fn setSuggestions(self: *Self, suggestions: []const CompletionSuggestion) void {
+        self.suggestions.container.clearAndFree();
+        self.next_suggestion_index = 0;
+        self.largest_common_suggestion_prefix_length = 0;
+        self.last_displayed_suggestion_index = 0;
+        self.selected_suggestion_index = 0;
+
+        for (suggestions) |s| {
+            _ = self.suggestions.container.append(s) catch unreachable; // TODO
+        }
+
+        if (self.suggestions.size() > 1) {
+            var prefix_len = @min(self.suggestions.container.items[0].text.len, self.suggestions.container.items[1].text.len);
+            for (2..self.suggestions.size()) |i| {
+                prefix_len = @min(
+                    prefix_len,
+                    commonPrefixLength(
+                        u8,
+                        self.suggestions.container.items[0].text,
+                        self.suggestions.container.items[i].text,
+                    ),
+                );
+            }
+            self.largest_common_suggestion_prefix_length = prefix_len;
+        } else if (self.suggestions.size() == 1) {
+            self.largest_common_suggestion_prefix_length = self.suggestions.container.items[0].text.len;
+        }
+    }
+
+    fn suggest(self: *Self) *CompletionSuggestion {
+        const suggestion = &self.suggestions.container.items[self.next_suggestion_index];
+        self.last_shown_suggestion = suggestion.*;
+        return suggestion;
+    }
+
+    pub fn setCurrentSuggestionInitiationIndex(self: *Self, index: usize) void {
+        const suggestion = self.suggest();
+        self.last_shown_suggestion.start_index = if (self.last_shown_suggestion_display_length > 0)
+            index - suggestion.static_offset - self.last_shown_suggestion_display_length
+        else
+            index - suggestion.static_offset - suggestion.invariant_offset;
+
+        self.last_shown_suggestion_display_length = suggestion.text.len;
+        self.last_shown_suggestion_was_complete = true;
+    }
+
+    pub fn attemptCompletion(self: *Self, mode: CompletionMode, initiation_index: usize) CompletionAttemptResult {
+        var result = CompletionAttemptResult{ .new_mode = mode };
+
+        if (self.next_suggestion_index < self.suggestions.size()) {
+            const next_suggestion = &self.suggestions.container.items[self.next_suggestion_index];
+            if (mode == .complete_prefix and !next_suggestion.allow_commit_without_listing) {
+                result.new_mode = .show_suggestions;
+                result.avoid_committing_to_single_suggestion = true;
+                self.last_shown_suggestion_display_length = 0;
+                self.last_shown_suggestion_was_complete = false;
+                self.last_shown_suggestion = .{ .text = "" };
+                return result;
+            }
+
+            const can_complete = next_suggestion.invariant_offset <= self.largest_common_suggestion_prefix_length;
+            var actual_offset: isize = 0;
+            var shown_length = self.last_shown_suggestion_display_length;
+            switch (mode) {
+                .complete_prefix => {
+                    actual_offset = 0;
+                },
+                .show_suggestions => {
+                    actual_offset = @intCast(next_suggestion.invariant_offset - self.largest_common_suggestion_prefix_length);
+                    if (can_complete and next_suggestion.allow_commit_without_listing) {
+                        shown_length = self.largest_common_suggestion_prefix_length + self.last_shown_suggestion.trailing_trivia.len;
+                    }
+                },
+                else => {
+                    if (self.last_shown_suggestion_display_length != 0) {
+                        actual_offset = @as(isize, @intCast(next_suggestion.invariant_offset)) - @as(isize, @intCast(self.last_shown_suggestion.text.len));
+                    }
+                },
+            }
+
+            const suggestion = self.suggest();
+            self.setCurrentSuggestionInitiationIndex(initiation_index);
+
+            result.offset_region_to_remove = .{
+                .start = next_suggestion.invariant_offset,
+                .end = shown_length,
+            };
+            result.new_cursor_offset = actual_offset;
+            result.static_offset_from_cursor = suggestion.static_offset;
+
+            if (mode == .complete_prefix) {
+                if (can_complete) {
+                    result.insert_storage[result.insert_count] = suggestion.text[suggestion.invariant_offset..self.largest_common_suggestion_prefix_length];
+                    result.insert_count += 1;
+                    self.last_shown_suggestion_display_length = self.largest_common_suggestion_prefix_length + suggestion.trailing_trivia.len;
+                    if (self.suggestions.size() == 1) {
+                        result.new_mode = .@"don't_complete";
+                        result.insert_storage[result.insert_count] = suggestion.trailing_trivia;
+                        result.insert_count += 1;
+                        self.last_shown_suggestion_display_length = 0;
+                        result.style_to_apply = suggestion.style;
+                        self.last_shown_suggestion_was_complete = true;
+                        return result;
+                    }
+                } else {
+                    self.last_shown_suggestion_display_length = 0;
+                }
+                result.new_mode = .show_suggestions;
+                self.last_shown_suggestion_was_complete = false;
+                self.last_shown_suggestion = .{ .text = "" };
+            } else {
+                result.insert_storage[result.insert_count] = suggestion.text[suggestion.invariant_offset..];
+                result.insert_count += 1;
+                result.insert_storage[result.insert_count] = suggestion.trailing_trivia;
+                result.insert_count += 1;
+                self.last_shown_suggestion_display_length += suggestion.trailing_trivia.len;
+            }
+        } else {
+            self.next_suggestion_index = 0;
+        }
+
+        return result;
+    }
+
+    pub fn next(self: *Self) void {
+        if (self.suggestions.size() == 0) return;
+        self.next_suggestion_index = (self.next_suggestion_index + 1) % self.suggestions.size();
+    }
+
+    pub fn previous(self: *Self) void {
+        if (self.suggestions.size() == 0) return;
+        if (self.next_suggestion_index == 0) {
+            self.next_suggestion_index = self.suggestions.size() - 1;
+        } else {
+            self.next_suggestion_index -= 1;
+        }
+    }
+
+    pub fn reset(self: *Self) void {
+        self.suggestions.container.clearAndFree();
+        self.next_suggestion_index = 0;
+        self.largest_common_suggestion_prefix_length = 0;
+        self.last_displayed_suggestion_index = 0;
+        self.selected_suggestion_index = 0;
+        self.last_shown_suggestion = .{ .text = "" };
+        self.last_shown_suggestion_display_length = 0;
+        self.last_shown_suggestion_was_complete = false;
+    }
+};
 pub const CSIMod = enum(u8) {
     none = 0,
     shift = 1,
@@ -820,6 +1181,12 @@ fn vtMoveRelative(row: i64, col: i64) !void {
     }
 }
 
+fn vtMoveAbsolute(row: usize, col: usize) !void {
+    var stderr_writer = SystemCapabilities.stderr().writer(&.{});
+    const stderr = &stderr_writer.interface;
+    try stderr.print("\x1b[{d};{d}H", .{ row + 1, col + 1 });
+}
+
 var signalHandlingData: ?struct {
     pipe: struct {
         write: std.posix.fd_t,
@@ -859,6 +1226,7 @@ pub const Editor = struct {
         bracket_args_semi,
         title,
     };
+    pub const CompletionSuggestion = Module.CompletionSuggestion;
     const DrawnSpans = struct {
         starting: AutoHashMap(usize, AutoHashMap(usize, Style)),
         ending: AutoHashMap(usize, AutoHashMap(usize, Style)),
@@ -943,6 +1311,21 @@ pub const Editor = struct {
             }
         };
     }
+    fn CallbackReturning(comptime T: type) type {
+        return struct {
+            f: *const fn (*anyopaque) T,
+            context: *anyopaque,
+
+            pub fn makeHandler(comptime U: type, comptime InnerT: type, comptime name: []const u8) type {
+                return struct {
+                    pub fn theHandler(context: *anyopaque) T {
+                        const ctx: U = @ptrCast(@alignCast(context));
+                        return @field(InnerT, name)(ctx);
+                    }
+                };
+            }
+        };
+    }
 
     // Error set stored in `input_error`
     const InputError =
@@ -955,6 +1338,7 @@ pub const Editor = struct {
     on: struct {
         display_refresh: ?Callback = null,
         paste: ?Callback1([]const u32) = null,
+        tab_complete: ?CallbackReturning(GetLineError![]const Module.CompletionSuggestion) = null,
     } = .{},
 
     allocator: Allocator,
@@ -994,10 +1378,10 @@ pub const Editor = struct {
     origin_row: usize = 0,
     origin_column: usize = 0,
     has_origin_reset_scheduled: bool = false,
-    suggestion_display: ?SuggestionDisplay = null,
+    suggestion_display: SuggestionDisplay,
     remembered_suggestion_static_data: ArrayList(u32),
     new_prompt: ArrayList(u8),
-    suggestion_manager: SuggestionManager = .{},
+    suggestion_manager: SuggestionManager,
     always_refresh: bool = false,
     tab_direction: enum {
         forward,
@@ -1322,10 +1706,12 @@ pub const Editor = struct {
             .pending_chars = .init(allocator),
             .incomplete_data = .init(allocator),
             .returned_line = &.{},
+            .suggestion_display = .init(allocator),
             .remembered_suggestion_static_data = .init(allocator),
             .history = .init(allocator),
             .current_spans = .init(allocator),
             .new_prompt = .init(allocator),
+            .suggestion_manager = .init(allocator),
             .paste_buffer = .init(allocator),
             .configuration = configuration,
             .cached_prompt_metrics = .init(allocator),
@@ -1344,6 +1730,8 @@ pub const Editor = struct {
         self.remembered_suggestion_static_data.deinit();
         self.history.deinit();
         self.new_prompt.deinit();
+        self.suggestion_manager.deinit();
+        self.suggestion_display.deinit();
         self.paste_buffer.deinit();
         self.current_spans.deinit();
         self.callback_machine.deinit();
@@ -1943,7 +2331,7 @@ pub const Editor = struct {
             return;
         };
 
-        if (self.cursor == self.buffer.size()) {
+        if (self.cursor >= self.buffer.size()) {
             self.buffer.container.append(code_point) catch unreachable;
             self.cursor = self.buffer.size();
             self.inline_search_cursor = self.cursor;
@@ -2047,9 +2435,7 @@ pub const Editor = struct {
         try self.callback_machine.registerKeyInputCallback(&.{.{ .code_point = c }}, f);
     }
 
-    fn vtApplyStyle(self: *Self, style: Style, writer: *std.Io.Writer, is_starting: bool) !void {
-        _ = self;
-
+    fn vtApplyStyle(style: Style, writer: *std.Io.Writer, is_starting: bool) !void {
         var buffer: [128]u8 = undefined;
         var fba = std.heap.FixedBufferAllocator.init(&buffer);
 
@@ -2209,6 +2595,7 @@ pub const Editor = struct {
                     else => {
                         try self.callback_machine.keyPressed(self, .{ .code_point = code_point, .modifiers = .alt });
                         self.input_state = .free;
+                        try self.cleanupSuggestions();
                         continue;
                     },
                 },
@@ -2429,7 +2816,120 @@ pub const Editor = struct {
             if (code_point == '\t' or reverse_tab) {
                 should_perform_suggestion_cleanup = false;
 
-                // TODO: on_tab_complete
+                if (self.on.tab_complete == null) {
+                    continue;
+                }
+
+                self.times_tab_pressed += 1;
+
+                const token_start = self.cursor;
+
+                var stderr_buffer: [1024]u8 = undefined;
+                var stderr_writer = SystemCapabilities.stderr().writer(&stderr_buffer);
+                const stderr = &stderr_writer.interface;
+
+                // Ask for completions on the first tab press only.
+                if (self.times_tab_pressed == 1) {
+                    const cb = self.on.tab_complete.?;
+                    self.suggestion_manager.setSuggestions(try cb.f(cb.context));
+                    self.suggestion_manager.last_displayed_suggestion_index = 0;
+                    self.prompt_lines_at_suggestion_initiation = self.numLines();
+                    if (self.suggestion_manager.suggestions.size() == 0) {
+                        // beep.
+                        stderr.writeAll("\x07") catch {};
+                    }
+                }
+
+                if (reverse_tab and self.tab_direction != .backward) {
+                    self.suggestion_manager.previous();
+                    self.suggestion_manager.previous();
+                    self.tab_direction = .backward;
+                }
+                if (!reverse_tab and self.tab_direction != .forward) {
+                    self.suggestion_manager.next();
+                    self.suggestion_manager.next();
+                    self.tab_direction = .forward;
+                }
+                reverse_tab = false;
+
+                const completion_mode: SuggestionManager.CompletionMode = switch (self.times_tab_pressed) {
+                    1 => .complete_prefix,
+                    2 => .show_suggestions,
+                    else => .cycle_suggestions,
+                };
+
+                self.insertUtf32(self.remembered_suggestion_static_data.container.items);
+                self.remembered_suggestion_static_data.container.clearRetainingCapacity();
+
+                const completion_result = self.suggestion_manager.attemptCompletion(completion_mode, token_start);
+                var new_cursor = self.cursor;
+                new_cursor = @intCast(@as(isize, @intCast(new_cursor)) + completion_result.new_cursor_offset);
+                const start_of_region_to_remove = self.cursor + completion_result.offset_region_to_remove.start - completion_result.offset_region_to_remove.end;
+                if (completion_result.offset_region_to_remove.end >= completion_result.offset_region_to_remove.start) {
+                    for (completion_result.offset_region_to_remove.start..completion_result.offset_region_to_remove.end) |_| {
+                        self.removeAtIndex(start_of_region_to_remove);
+                    }
+                }
+
+                new_cursor -= completion_result.static_offset_from_cursor;
+                for (0..completion_result.static_offset_from_cursor) |_| {
+                    try self.remembered_suggestion_static_data.container.append(self.buffer.container.items[new_cursor]);
+                    self.removeAtIndex(new_cursor);
+                }
+
+                self.cursor = new_cursor;
+                self.inline_search_cursor = self.cursor;
+                self.refresh_needed = true;
+                self.chars_touched_in_the_middle += 1;
+
+                for (completion_result.insert_storage[0..completion_result.insert_count]) |item| {
+                    self.insertString(item);
+                }
+
+                try self.repositionCursor(stderr, false);
+
+                if (completion_result.style_to_apply) |style| {
+                    try self.stylize(Span{
+                        .begin = self.suggestion_manager.last_shown_suggestion.start_index,
+                        .end = self.cursor,
+                        .mode = .code_point_oriented,
+                    }, style);
+                }
+
+                switch (completion_result.new_mode) {
+                    .@"don't_complete" => {
+                        self.times_tab_pressed = 0;
+                        self.remembered_suggestion_static_data.container.clearRetainingCapacity();
+                    },
+                    .complete_prefix => {},
+                    else => {
+                        self.times_tab_pressed += 1;
+                    },
+                }
+
+                if (self.times_tab_pressed > 1 and self.suggestion_manager.suggestions.size() > 0) {
+                    if (try self.suggestion_display.cleanup()) {
+                        try self.repositionCursor(stderr, false);
+                    }
+                    self.suggestion_display.prompt_lines_at_suggestion_initiation = self.prompt_lines_at_suggestion_initiation;
+                    try self.suggestion_display.display(&self.suggestion_manager);
+                    self.origin_row = self.suggestion_display.origin_row;
+                }
+
+                if (self.times_tab_pressed > 1) {
+                    if (self.tab_direction == .forward) {
+                        self.suggestion_manager.next();
+                    } else {
+                        self.suggestion_manager.previous();
+                    }
+                }
+
+                if (self.suggestion_manager.suggestions.size() < 2 and !completion_result.avoid_committing_to_single_suggestion) {
+                    try self.repositionCursor(stderr, true);
+                    try self.cleanupSuggestions();
+                    self.remembered_suggestion_static_data.container.clearRetainingCapacity();
+                }
+
                 continue;
             }
 
@@ -2832,7 +3332,7 @@ pub const Editor = struct {
                     try self.applyStyles(&empty_styles, stderr, i);
                     try self.printCharacterAt(i, stderr);
                 }
-                try self.vtApplyStyle(.reset, stderr, true);
+                try vtApplyStyle(.reset, stderr, true);
                 self.pending_chars.container.clearAndFree();
                 self.drawn_cursor = self.cursor;
                 self.drawn_end_of_line_offset = self.buffer.size();
@@ -2858,7 +3358,7 @@ pub const Editor = struct {
             try self.printCharacterAt(i, stderr);
         }
 
-        try self.vtApplyStyle(.reset, stderr, true);
+        try vtApplyStyle(.reset, stderr, true);
 
         self.pending_chars.container.clearAndFree();
         self.refresh_needed = false;
@@ -2909,11 +3409,11 @@ pub const Editor = struct {
             }
 
             // Disable any style that should be turned off.
-            try self.vtApplyStyle(style, writer, false);
+            try vtApplyStyle(style, writer, false);
 
             // Reapply styles for overlapping spans that include this one.
             style = self.findApplicableStyle(index);
-            try self.vtApplyStyle(style, writer, true);
+            try vtApplyStyle(style, writer, true);
         }
 
         if (starts.container.count() > 0) {
@@ -2924,7 +3424,7 @@ pub const Editor = struct {
             }
 
             // Set new styles.
-            try self.vtApplyStyle(style, writer, true);
+            try vtApplyStyle(style, writer, true);
         }
     }
 
@@ -2971,7 +3471,23 @@ pub const Editor = struct {
     }
 
     fn cleanupSuggestions(self: *Self) !void {
-        _ = self;
+        if (self.times_tab_pressed != 0) {
+            self.stylize(Span{
+                .begin = self.suggestion_manager.last_shown_suggestion.start_index,
+                .end = self.cursor,
+                .mode = .code_point_oriented,
+            }, self.suggestion_manager.last_shown_suggestion.style) catch {};
+
+            if (try self.suggestion_display.cleanup()) {
+                var stderr_writer = SystemCapabilities.stderr().writer(&.{});
+                const stderr = &stderr_writer.interface;
+                try self.repositionCursor(stderr, false);
+                self.refresh_needed = true;
+            }
+            self.suggestion_manager.reset();
+            self.suggestion_display.finish();
+        }
+        self.times_tab_pressed = 0;
     }
 
     fn reallyQuitEventLoop(self: *Self) !void {
@@ -3053,10 +3569,8 @@ pub const Editor = struct {
     fn setOriginValues(self: *Self, row: usize, column: usize) void {
         self.origin_row = row;
         self.origin_column = column;
-        if (self.suggestion_display) |*display| {
-            _ = display;
-            // FIXME: display.setOriginValues(row, column);
-        }
+        self.suggestion_display.origin_row = row;
+        self.suggestion_display.origin_column = column;
     }
 
     fn recalculateOrigin(self: *Self) void {
@@ -3106,6 +3620,10 @@ pub const Editor = struct {
     fn getTerminalSize(self: *Self) void {
         self.num_columns = 80;
         self.num_lines = 24;
+        defer {
+            self.suggestion_display.columns = self.num_columns;
+            self.suggestion_display.lines = self.num_lines;
+        }
         if (!is_windows) {
             const ws = SystemCapabilities.getWinsize(SystemCapabilities.stdin().handle) catch {
                 return;
