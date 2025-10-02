@@ -40,6 +40,7 @@ fn main_generic(allocator: std.mem.Allocator) !void {
 
     var handler: struct {
         editor: *Editor,
+        completion_storage: [4]Editor.CompletionSuggestion = @splat(.{ .text = "" }),
 
         pub fn display_refresh(self: *@This()) void {
             self.editor.stripStyles();
@@ -75,6 +76,54 @@ fn main_generic(allocator: std.mem.Allocator) !void {
             self.editor.insertCodePoint('[');
             self.editor.insertUtf32(text);
             self.editor.insertCodePoint(']');
+        }
+
+        pub fn tab_complete(self: *@This()) ![]const Editor.CompletionSuggestion {
+            var count: usize = 1;
+            self.completion_storage[0] = if (self.editor.cursor == 0)
+                .{
+                    .text = "t",
+                    .start_index = 0,
+                }
+            else b: {
+                const next = switch (self.editor.getBuffer()[self.editor.cursor - 1]) {
+                    't' => "e",
+                    'e' => "s",
+                    's' => "t",
+                    else => return &.{},
+                };
+                break :b .{
+                    .text = next,
+                    .start_index = self.editor.cursor,
+                    .allow_commit_without_listing = false,
+                };
+            };
+            switch (self.completion_storage[count - 1].text[0]) {
+                's' => {
+                    self.completion_storage[count] = .{
+                        .text = "st",
+                        .start_index = self.editor.cursor,
+                    };
+                    count += 1;
+                },
+                't' => {
+                    self.completion_storage[count] = .{
+                        .text = "test2",
+                        .start_index = self.editor.cursor,
+                    };
+                    count += 1;
+                },
+                else => {},
+            }
+            if (count == 2) {
+                self.completion_storage[count] = .{
+                    .text = "toast",
+                    .start_index = self.editor.cursor,
+                };
+                count += 1;
+            }
+
+            return self.completion_storage[0..count];
         }
     } = .{ .editor = &editor };
     editor.setHandler(&handler);
