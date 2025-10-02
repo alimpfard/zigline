@@ -2586,7 +2586,7 @@ pub const Editor = struct {
                 continue;
             }
 
-            switch (self.input_state) {
+            state: switch (self.input_state) {
                 .got_escape => switch (code_point) {
                     '[' => {
                         self.input_state = .csi_expect_parameter;
@@ -2665,7 +2665,7 @@ pub const Editor = struct {
                         if (csi_final == 'Z') {
                             // 'reverse tab'
                             reverse_tab = true;
-                            break;
+                            break :state;
                         }
 
                         try self.cleanupSuggestions();
