@@ -2317,7 +2317,8 @@ pub const Editor = struct {
     }
 
     pub fn insertString(self: *Self, string: []const u8) void {
-        for (string) |code_point| {
+        var it = std.unicode.Utf8Iterator{ .bytes = string, .i = 0 };
+        while (it.nextCodepoint()) |code_point| {
             self.insertCodePoint(code_point);
         }
     }
