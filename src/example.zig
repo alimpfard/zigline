@@ -18,21 +18,15 @@ pub const std_options: std.Options = switch (builtin.os.tag) {
     else => .{},
 };
 
-pub fn main() void {
-    switch (builtin.os.tag) {
-        .uefi => main_uefi(std.os.uefi.pool_allocator) catch {},
-        else => {
-            var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
-            defer _ = debug_allocator.deinit();
-            main_generic(debug_allocator.allocator()) catch |err| {
-                std.debug.print("Error: {t}\n", .{err});
-            };
-        },
-    }
-}
+pub const main = switch (builtin.os.tag) {
+    .uefi => mainUefi,
+    else => mainGeneric,
+};
 
-fn main_generic(allocator: std.mem.Allocator) !void {
-    var editor = Editor.init(allocator, .{});
+fn mainGeneric(init: std.process.Init) !void {
+    const gpa = init.gpa;
+    const io = init.io;
+    var editor = Editor.init(gpa, io, .{});
     defer editor.deinit();
 
     try editor.loadHistory("test.hist");
@@ -133,7 +127,7 @@ fn main_generic(allocator: std.mem.Allocator) !void {
             error.Eof => break,
             else => return err,
         };
-        defer allocator.free(line);
+        defer gpa.free(line);
 
         try editor.addToHistory(line);
         std.log.info("line ({d} bytes): {s}\n", .{ line.len, line });
@@ -144,8 +138,15 @@ fn main_generic(allocator: std.mem.Allocator) !void {
     }
 }
 
-fn main_uefi(allocator: std.mem.Allocator) !void {
-    var editor = Editor.init(allocator, .{});
+fn mainUefi() void {
+    _mainUefi() catch {};
+}
+
+fn _mainUefi() !void {
+    const gpa = std.os.uefi.pool_allocator;
+    // For now UEFI uses its own abstractions without accessing the Io instance
+    const io: std.Io = .failing;
+    var editor = Editor.init(gpa, io, .{});
     defer editor.deinit();
 
     // kiesel: src/branch/main/src/uefi.zig
@@ -163,7 +164,7 @@ fn main_uefi(allocator: std.mem.Allocator) !void {
             error.Eof => break,
             else => return err,
         };
-        defer allocator.free(line);
+        defer gpa.free(line);
 
         try editor.addToHistory(line);
         try stdout.print("line ({d} bytes): {s}\n", .{ line.len, line });

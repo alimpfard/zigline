@@ -1,8 +1,8 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Thread = std.Thread;
-const Condition = Thread.Condition;
-const Mutex = Thread.Mutex;
+const Condition = std.Io.Condition;
+const Mutex = std.Io.Mutex;
 
 const sane = @import("sane.zig");
 const uefi = @import("uefi.zig");
@@ -48,7 +48,11 @@ pub const SystemCapabilities = switch (builtin.os.tag) {
     => struct {
         const Self = @This();
         pub const Sigaction = struct {}; // This is not implemented in Zig, and we're not about to try.
-        pub const pollfd = std.posix.pollfd;
+        pub const pollfd = struct {
+            fd: std.posix.fd_t,
+            events: i16,
+            revents: i16,
+        };
 
         pub const termios = struct {};
         pub const V = enum {
@@ -68,37 +72,32 @@ pub const SystemCapabilities = switch (builtin.os.tag) {
 
         pub const default_operation_mode: Configuration.OperationMode = .non_interactive;
 
-        pub const stdin = std.fs.File.stdin;
-        pub const stdout = std.fs.File.stdout;
-        pub const stderr = std.fs.File.stderr;
+        pub const stdin = std.Io.File.stdin;
+        pub const stdout = std.Io.File.stdout;
+        pub const stderr = std.Io.File.stderr;
 
         pub const winsize = struct {
             col: u16,
             row: u16,
         };
-        const getWinsize = if (builtin.os.tag == .windows) struct {
-            pub fn getWinsize(handle: anytype) !winsize {
-                var ws: std.posix.winsize = undefined;
-                if (std.c.ioctl(handle, std.posix.T.IOCGWINSZ, @intFromPtr(&ws)) != 0 or
-                    ws.ws_col == 0 or
-                    ws.ws_row == 0)
-                {
-                    const fd = std.posix.open("/dev/tty", .{ .ACCMODE = .RDONLY }, @as(std.posix.mode_t, 0)) catch return;
-                    if (fd != -1) {
-                        _ = std.c.ioctl(@intCast(fd), std.posix.T.IOCGWINSZ, @intFromPtr(&ws));
-                        _ = std.posix.close(@intCast(fd));
-                    } else {
-                        return error.Invalid;
-                    }
-                }
-                return .{ .col = ws.ws_col, .row = ws.ws_row };
+
+        pub fn getWinsize(io: std.Io) !winsize {
+            switch (builtin.os.tag) {
+                .windows => {
+                    const file = stderr();
+                    var get_console_info = std.os.windows.CONSOLE.USER_IO.GET_SCREEN_BUFFER_INFO;
+                    return switch (try get_console_info.operate(io, file)) {
+                        .SUCCESS => .{
+                            .col = @intCast(get_console_info.Data.dwWindowSize.X),
+                            .row = @intCast(get_console_info.Data.dwWindowSize.Y),
+                        },
+                        else => .{ .col = 80, .row = 24 },
+                    };
+                },
+                .wasi => return .{ .col = 80, .row = 24 },
+                else => comptime unreachable,
             }
-        } else struct {
-            pub fn getWinsize(handle: anytype) !winsize {
-                _ = handle;
-                return .{ .col = 80, .row = 24 };
-            }
-        }.getWinsize;
+        }
 
         pub fn getTermios() !Self.termios {
             return .{};
@@ -126,17 +125,17 @@ pub const SystemCapabilities = switch (builtin.os.tag) {
             };
         }
 
-        pub const POLL_IN = std.posix.POLL.RDNORM;
+        pub const POLL_IN: i16 = 256;
 
         pub fn setPollFd(p: *Self.pollfd, f: anytype) void {
-            if (builtin.os.tag == .windows) {
-                p.fd = @ptrCast(f);
-            } else {
-                p.fd = f;
+            switch (builtin.os.tag) {
+                .windows => p.fd = @ptrCast(f),
+                .wasi => p.fd = f,
+                else => comptime unreachable,
             }
         }
 
-        pub const nfds_t = std.posix.nfds_t;
+        pub const nfds_t = u32;
         pub fn poll(fds: [*]Self.pollfd, n: nfds_t, timeout: i32) c_int {
             // std.posix.poll() has a Windows implementation but doesn't accept the second arg, only a slice.
             _ = timeout;
@@ -144,20 +143,25 @@ pub const SystemCapabilities = switch (builtin.os.tag) {
             return 1;
         }
 
-        const pipe = (if (is_windows) struct {
-            pub fn pipe() ![2]std.posix.fd_t {
-                var rd: std.os.windows.HANDLE = undefined;
-                var wr: std.os.windows.HANDLE = undefined;
-                var attrs: std.os.windows.SECURITY_ATTRIBUTES = undefined;
-                attrs.nLength = 0;
-                try std.os.windows.CreatePipe(&rd, &wr, &attrs);
-                return .{ @ptrCast(rd), @ptrCast(wr) };
+        pub const WindowsCreatePipeError = error{ AccessDenied, NoDevice, FileNotFound, IsDir, NotDir, BadPathName, SystemResources, Unexpected, Canceled };
+
+        pub fn pipe() ![2]std.posix.fd_t {
+            switch (builtin.os.tag) {
+                .windows => {
+                    const threaded = std.Io.Threaded.global_single_threaded;
+                    return threaded.windowsCreatePipe(.{
+                        .server = .{ .mode = .{ .IO = .SYNCHRONOUS_NONALERT } },
+                        .client = .{ .mode = .{ .IO = .SYNCHRONOUS_NONALERT } },
+                        .inbound = true,
+                        .outbound = true,
+                    });
+                },
+                .wasi => {
+                    return std.Io.Threaded.pipe2(.{});
+                },
+                else => comptime unreachable,
             }
-        } else struct {
-            pub fn pipe() ![2]std.posix.fd_t {
-                return std.posix.pipe();
-            }
-        }).pipe;
+        }
     },
     .uefi => struct {
         const Self = @This();
@@ -186,7 +190,7 @@ pub const SystemCapabilities = switch (builtin.os.tag) {
                 stderr,
             },
 
-            pub fn reader(self: File, buffer: []u8) uefi.Reader {
+            pub fn reader(self: File, _: std.Io, buffer: []u8) uefi.Reader {
                 return switch (self.handle) {
                     .stdin => .init(
                         buffer,
@@ -198,7 +202,7 @@ pub const SystemCapabilities = switch (builtin.os.tag) {
                 };
             }
 
-            pub fn writer(self: File, buffer: []u8) uefi.Writer {
+            pub fn writer(self: File, _: std.Io, buffer: []u8) uefi.Writer {
                 return switch (self.handle) {
                     .stdout => .init(
                         buffer,
@@ -214,8 +218,8 @@ pub const SystemCapabilities = switch (builtin.os.tag) {
                 };
             }
 
-            // Direct `read()` is only needed for poll so we can stub it out
-            pub fn read(_: File, _: []u8) !usize {
+            // Direct `readStreaming()` is only needed for poll so we can stub it out
+            pub fn readStreaming(_: File, _: std.Io, _: []const []u8) !usize {
                 return 0;
             }
         };
@@ -236,12 +240,10 @@ pub const SystemCapabilities = switch (builtin.os.tag) {
             col: u16,
             row: u16,
         };
-        const getWinsize = struct {
-            pub fn getWinsize(handle: anytype) !winsize {
-                _ = handle;
-                return .{ .col = 80, .row = 24 };
-            }
-        }.getWinsize;
+
+        pub fn getWinsize(_: std.Io) !winsize {
+            return .{ .col = 80, .row = 24 };
+        }
 
         pub fn getTermios() !Self.termios {
             return .{};
@@ -274,11 +276,7 @@ pub const SystemCapabilities = switch (builtin.os.tag) {
             return 1;
         }
 
-        const pipe = struct {
-            pub fn pipe() ![2]std.posix.fd_t {
-                return .{ 0, 0 };
-            }
-        }.pipe;
+        pub const pipe = @compileError("not available");
     },
     else => struct {
         const Self = @This();
@@ -291,27 +289,25 @@ pub const SystemCapabilities = switch (builtin.os.tag) {
 
         pub const default_operation_mode: Configuration.OperationMode = .full;
 
-        pub const stdin = std.fs.File.stdin;
-        pub const stdout = std.fs.File.stdout;
-        pub const stderr = std.fs.File.stderr;
+        pub const stdin = std.Io.File.stdin;
+        pub const stdout = std.Io.File.stdout;
+        pub const stderr = std.Io.File.stderr;
 
-        pub fn getWinsize(handle: anytype) !std.posix.winsize {
-            var ws: std.posix.winsize = undefined;
-            const ioctl = if (builtin.os.tag == .linux) std.os.linux.ioctl else std.c.ioctl;
-            if (ioctl(handle, std.posix.T.IOCGWINSZ, @intFromPtr(&ws)) != 0 or
-                ws.col == 0 or
-                ws.row == 0)
-            {
-                const fd = try std.posix.open("/dev/tty", .{ .ACCMODE = .RDONLY }, @as(std.posix.mode_t, 0));
-                if (fd != -1) {
-                    _ = ioctl(@intCast(fd), std.posix.T.IOCGWINSZ, @intFromPtr(&ws));
-                    _ = std.posix.close(@intCast(fd));
-                } else {
-                    return error.Invalid;
-                }
-            }
+        pub fn getWinsize(io: std.Io) !std.posix.winsize {
+            const file = stderr();
+            var winsize: std.posix.winsize = .{
+                .row = 24,
+                .col = 80,
+                .xpixel = 0,
+                .ypixel = 0,
+            };
 
-            return ws;
+            _ = (try io.operate(.{ .device_io_control = .{
+                .file = file,
+                .code = std.posix.T.IOCGWINSZ,
+                .arg = &winsize,
+            } })).device_io_control;
+            return winsize;
         }
 
         pub fn getTermios() !Self.termios {
@@ -344,7 +340,9 @@ pub const SystemCapabilities = switch (builtin.os.tag) {
             return std.posix.system.poll(fds, n, timeout);
         }
 
-        pub const pipe = std.posix.pipe;
+        pub fn pipe() ![2]std.posix.fd_t {
+            return std.Io.Threaded.pipe2(.{});
+        }
     },
 };
 
@@ -606,6 +604,7 @@ pub const StringMetrics = struct {
 
 pub const SuggestionDisplay = struct {
     allocator: Allocator,
+    io: std.Io,
     origin_row: usize = 0,
     origin_column: usize = 0,
     is_showing: bool = false,
@@ -617,8 +616,8 @@ pub const SuggestionDisplay = struct {
 
     const Self = @This();
 
-    pub fn init(allocator: Allocator) Self {
-        return .{ .allocator = allocator, .pages = .init(allocator) };
+    pub fn init(allocator: Allocator, io: std.Io) Self {
+        return .{ .allocator = allocator, .io = io, .pages = .init(allocator) };
     }
 
     pub fn deinit(self: *Self) void {
@@ -632,7 +631,7 @@ pub const SuggestionDisplay = struct {
     pub fn cleanup(self: *Self) !bool {
         self.is_showing = false;
         if (self.lines_used_for_last_suggestion > 0) {
-            var stderr_writer = SystemCapabilities.stderr().writer(&.{});
+            var stderr_writer = SystemCapabilities.stderr().writer(self.io, &.{});
             const stderr = &stderr_writer.interface;
             // Save cursor position
             try stderr.print("\x1b7", .{});
@@ -654,7 +653,7 @@ pub const SuggestionDisplay = struct {
     pub fn display(self: *Self, manager: *SuggestionManager) !void {
         self.is_showing = true;
 
-        var stderr_writer = SystemCapabilities.stderr().writer(&.{});
+        var stderr_writer = SystemCapabilities.stderr().writer(self.io, &.{});
         const stderr = &stderr_writer.interface;
 
         var longest_suggestion_length: usize = 0;
@@ -683,7 +682,7 @@ pub const SuggestionDisplay = struct {
             longest_suggestion_length = 0;
         }
 
-        try vtMoveAbsolute(self.prompt_lines_at_suggestion_initiation + self.origin_row - 1, 0);
+        try vtMoveAbsolute(self.prompt_lines_at_suggestion_initiation + self.origin_row - 1, 0, stderr);
 
         if (self.pages.size() == 0) {
             var printed: usize = 0;
@@ -1117,19 +1116,19 @@ pub const KeyCallbackMachine = struct {
 pub const HistoryEntry = struct {
     allocator: Allocator,
     entry: []const u8,
-    timestamp: i64,
+    timestamp: std.Io.Timestamp,
 
     const Self = @This();
 
-    pub fn init(allocator: Allocator, entry: []const u8) !Self {
+    pub fn init(allocator: Allocator, io: std.Io, entry: []const u8) !Self {
         return .{
             .allocator = allocator,
             .entry = try allocator.dupe(u8, entry),
-            .timestamp = std.time.timestamp(),
+            .timestamp = .now(io, .real),
         };
     }
 
-    pub fn initWithTimestamp(allocator: Allocator, entry: []const u8, timestamp: i64) !Self {
+    pub fn initWithTimestamp(allocator: Allocator, entry: []const u8, timestamp: std.Io.Timestamp) !Self {
         return .{
             .allocator = allocator,
             .entry = try allocator.dupe(u8, entry),
@@ -1153,7 +1152,7 @@ pub const Configuration = struct {
     enable_signal_handling: bool = should_enable_signal_handling,
 };
 
-fn vtMoveRelative(row: i64, col: i64) !void {
+fn vtMoveRelative(row: i64, col: i64, stderr: *std.Io.Writer) !void {
     var x_op: u8 = 'A';
     var y_op: u8 = 'D';
     var r = row;
@@ -1171,8 +1170,6 @@ fn vtMoveRelative(row: i64, col: i64) !void {
         c = -col;
     }
 
-    var stderr_writer = SystemCapabilities.stderr().writer(&.{});
-    const stderr = &stderr_writer.interface;
     if (row > 0) {
         try stderr.print("\x1b[{d}{c}", .{ r, x_op });
     }
@@ -1181,9 +1178,7 @@ fn vtMoveRelative(row: i64, col: i64) !void {
     }
 }
 
-fn vtMoveAbsolute(row: usize, col: usize) !void {
-    var stderr_writer = SystemCapabilities.stderr().writer(&.{});
-    const stderr = &stderr_writer.interface;
+fn vtMoveAbsolute(row: usize, col: usize, stderr: *std.Io.Writer) !void {
     try stderr.print("\x1b[{d};{d}H", .{ row + 1, col + 1 });
 }
 
@@ -1195,12 +1190,16 @@ var signalHandlingData: ?struct {
     old_sigint: ?SystemCapabilities.Sigaction = null,
     old_sigwinch: ?SystemCapabilities.Sigaction = null,
 
-    pub fn handleSignal(signo: i32) callconv(.c) void {
-        var file: std.fs.File = .{ .handle = signalHandlingData.?.pipe.write };
+    pub fn handleSignal(sig: std.posix.SIG) callconv(.c) void {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        var file: std.Io.File = .{
+            .handle = signalHandlingData.?.pipe.write,
+            .flags = .{ .nonblocking = false },
+        };
         var buffer: [4]u8 = undefined;
-        var file_writer = file.writer(&buffer);
+        var file_writer = file.writerStreaming(io, &buffer);
         const writer = &file_writer.interface;
-        writer.writeInt(i32, signo, .little) catch {};
+        writer.writeInt(u32, @intFromEnum(sig), .little) catch {};
     }
 } = null;
 
@@ -1331,9 +1330,11 @@ pub const Editor = struct {
     const InputError =
         std.Io.Writer.Error ||
         std.mem.Allocator.Error ||
-        std.posix.PipeError ||
-        std.posix.ReadError ||
-        error{ Empty, Eof, SystemResource };
+        error{ Empty, Eof, SystemResource } ||
+        switch (builtin.os.tag) {
+            .uefi => error{},
+            else => std.Io.Threaded.PipeError,
+        };
 
     on: struct {
         display_refresh: ?Callback = null,
@@ -1342,6 +1343,7 @@ pub const Editor = struct {
     } = .{},
 
     allocator: Allocator,
+    io: std.Io,
     buffer: ArrayList(u32),
     finished: bool = false,
     search_editor: ?*Self = null,
@@ -1412,9 +1414,10 @@ pub const Editor = struct {
 
     const Loop = if (builtin.os.tag == .wasi or builtin.os.tag == .uefi)
         struct {
-            pub fn init(allocator: Allocator, configuration: Configuration) Loop {
-                _ = configuration;
+            pub fn init(allocator: Allocator, io: std.Io, configuration: Configuration) Loop {
                 _ = allocator;
+                _ = io;
+                _ = configuration;
                 return .{};
             }
 
@@ -1426,7 +1429,7 @@ pub const Editor = struct {
                 _ = self;
             }
 
-            pub fn pump(self: *Loop) void {
+            pub fn pump(self: *Loop) !void {
                 _ = self;
             }
 
@@ -1467,6 +1470,7 @@ pub const Editor = struct {
         }
     else
         struct {
+            io: std.Io,
             enable_signal_handling: bool,
             control_thread: ?Thread = null,
             control_thread_exited: bool = false,
@@ -1474,17 +1478,18 @@ pub const Editor = struct {
                 write: std.posix.fd_t,
                 read: std.posix.fd_t,
             } = null,
-            queue_cond_mutex: Mutex = .{},
-            queue_condition: Condition = .{},
-            logic_cond_mutex: Mutex = .{},
-            logic_condition: Condition = .{},
+            queue_cond_mutex: Mutex = .init,
+            queue_condition: Condition = .init,
+            logic_cond_mutex: Mutex = .init,
+            logic_condition: Condition = .init,
             loop_queue: Queue(LoopExitCode),
             deferred_action_queue: Queue(DeferredAction),
             signal_queue: Queue(Signal),
             input_error: ?Wrapped(InputError) = null,
 
-            pub fn init(allocator: Allocator, configuration: Configuration) Loop {
+            pub fn init(allocator: Allocator, io: std.Io, configuration: Configuration) Loop {
                 return .{
+                    .io = io,
                     .enable_signal_handling = configuration.enable_signal_handling,
                     .loop_queue = .init(allocator),
                     .deferred_action_queue = .init(allocator),
@@ -1501,13 +1506,13 @@ pub const Editor = struct {
             pub fn stop(self: *Loop) !void {
                 if (self.control_thread) |t| {
                     self.nicelyAskControlThreadToDie() catch {};
-                    self.logic_condition.broadcast();
+                    self.logic_condition.broadcast(self.io);
                     t.join();
                 }
             }
 
-            pub fn pump(self: *Loop) void {
-                self.queue_condition.wait(&self.queue_cond_mutex);
+            pub fn pump(self: *Loop) !void {
+                try self.queue_condition.wait(self.io, &self.queue_cond_mutex);
             }
 
             fn nicelyAskControlThreadToDie(self: *Loop) !void {
@@ -1517,7 +1522,11 @@ pub const Editor = struct {
 
                 // In the absence of way to interrupt threads, we're just gonna write to it and hope it dies on its own pace.
                 if (self.thread_kill_pipe) |pipes| {
-                    _ = std.posix.write(pipes.write, "x") catch 0;
+                    const file: std.Io.File = .{
+                        .handle = pipes.write,
+                        .flags = .{ .nonblocking = false },
+                    };
+                    try file.writeStreamingAll(self.io, "x");
                 }
             }
 
@@ -1530,12 +1539,12 @@ pub const Editor = struct {
             const Process = struct {
                 loop: *Loop,
                 pub fn done(self: *@This()) void {
-                    self.loop.queue_cond_mutex.unlock();
+                    self.loop.queue_cond_mutex.unlock(self.loop.io);
                 }
             };
 
             pub fn process(self: *Loop) !Process {
-                self.queue_cond_mutex.lock();
+                try self.queue_cond_mutex.lock(self.io);
 
                 if (self.thread_kill_pipe == null) {
                     const pipe = try SystemCapabilities.pipe();
@@ -1550,14 +1559,14 @@ pub const Editor = struct {
 
             pub fn loopAction(self: *Loop, code: LoopExitCode) !void {
                 try self.loop_queue.enqueue(code);
-                self.queue_condition.broadcast();
+                self.queue_condition.broadcast(self.io);
             }
 
             pub fn deferredInvoke(self: *Loop, action: DeferredAction) !void {
                 try self.deferred_action_queue.enqueue(action);
             }
 
-            fn controlThreadMain(self: *Loop) void {
+            fn controlThreadMain(self: *Loop) !void {
                 defer self.control_thread_exited = true;
 
                 const stdin = SystemCapabilities.stdin();
@@ -1579,13 +1588,13 @@ pub const Editor = struct {
                     nfds = 3;
                 }
 
-                defer self.queue_condition.broadcast();
+                defer self.queue_condition.broadcast(self.io);
 
                 while (true) {
-                    self.logic_cond_mutex.lock();
+                    try self.logic_cond_mutex.lock(self.io);
 
                     {
-                        defer self.logic_cond_mutex.unlock();
+                        defer self.logic_cond_mutex.unlock(self.io);
                         const rc = SystemCapabilities.poll(&pollfds, nfds, std.math.maxInt(i32));
                         if (rc < 0) {
                             self.input_error = switch (std.posix.errno(rc)) {
@@ -1600,30 +1609,37 @@ pub const Editor = struct {
                             self.loop_queue.enqueue(.exit) catch {
                                 break;
                             };
-                            self.queue_condition.broadcast();
+                            self.queue_condition.broadcast(self.io);
                             break;
                         }
                     }
 
                     if (pollfds[1].revents & SystemCapabilities.POLL_IN != 0) {
                         // We're supposed to die...after draining the pipe.
+                        const file: std.Io.File = .{
+                            .handle = self.thread_kill_pipe.?.read,
+                            .flags = .{ .nonblocking = false },
+                        };
                         var buf: [8]u8 = @splat(0);
-                        _ = std.posix.read(self.thread_kill_pipe.?.read, &buf) catch 0;
+                        _ = file.readStreaming(self.io, &.{&buf}) catch 0;
                         break;
                     }
 
                     if (!is_windows) {
                         if (pollfds[2].revents & SystemCapabilities.POLL_IN != 0) no_read: {
                             // A signal! Let's handle it.
-                            var file: std.fs.File = .{ .handle = signalHandlingData.?.pipe.read };
+                            var file: std.Io.File = .{
+                                .handle = signalHandlingData.?.pipe.read,
+                                .flags = .{ .nonblocking = false },
+                            };
                             var buffer: [4]u8 = undefined;
-                            var file_reader = file.reader(&buffer);
+                            var file_reader = file.readerStreaming(self.io, &buffer);
                             const reader = &file_reader.interface;
-                            const signo = reader.takeInt(i32, .little) catch {
+                            const sig = reader.takeEnum(std.posix.SIG, .little) catch {
                                 break :no_read;
                             };
-                            switch (signo) {
-                                std.posix.SIG.WINCH => {
+                            switch (sig) {
+                                .WINCH => {
                                     self.signal_queue.enqueue(.SIGWINCH) catch {
                                         break :no_read;
                                     };
@@ -1632,23 +1648,23 @@ pub const Editor = struct {
                                     break :no_read;
                                 },
                             }
-                            self.queue_condition.broadcast();
+                            self.queue_condition.broadcast(self.io);
                             // Wait for the main thread to process the event, any further input between now and then will be
                             // picked up either immediately, or in the next cycle.
-                            self.logic_cond_mutex.lock();
-                            defer self.logic_cond_mutex.unlock();
-                            self.logic_condition.wait(&self.logic_cond_mutex);
+                            try self.logic_cond_mutex.lock(self.io);
+                            defer self.logic_cond_mutex.unlock(self.io);
+                            try self.logic_condition.wait(self.io, &self.logic_cond_mutex);
                         }
                     }
 
                     if (pollfds[0].revents & SystemCapabilities.POLL_IN != 0) {
                         self.deferred_action_queue.enqueue(.{ .try_update_once = 0 }) catch {};
-                        self.logic_cond_mutex.lock();
-                        defer self.logic_cond_mutex.unlock();
-                        self.queue_condition.broadcast();
+                        try self.logic_cond_mutex.lock(self.io);
+                        defer self.logic_cond_mutex.unlock(self.io);
+                        self.queue_condition.broadcast(self.io);
                         // Wait for the main thread to process the event, any further input between now and then will be
                         // picked up either immediately, or in the next cycle.
-                        self.logic_condition.wait(&self.logic_cond_mutex);
+                        try self.logic_condition.wait(self.io, &self.logic_cond_mutex);
                     }
                 }
             }
@@ -1677,7 +1693,7 @@ pub const Editor = struct {
             }
 
             pub fn handle(self: *Loop, handlers: anytype) !HandleResult {
-                defer self.logic_condition.broadcast();
+                defer self.logic_condition.broadcast(self.io);
 
                 while (!self.signal_queue.isEmpty() or !self.loop_queue.isEmpty() or !self.deferred_action_queue.isEmpty()) {
                     try self.handleSignalOrLoopAction(handlers);
@@ -1697,16 +1713,17 @@ pub const Editor = struct {
             }
         };
 
-    pub fn init(allocator: Allocator, configuration: Configuration) Self {
+    pub fn init(allocator: Allocator, io: std.Io, configuration: Configuration) Self {
         return .{
             .allocator = allocator,
+            .io = io,
             .buffer = .init(allocator),
             .callback_machine = .init(allocator),
             .pre_search_buffer = .init(allocator),
             .pending_chars = .init(allocator),
             .incomplete_data = .init(allocator),
             .returned_line = &.{},
-            .suggestion_display = .init(allocator),
+            .suggestion_display = .init(allocator, io),
             .remembered_suggestion_static_data = .init(allocator),
             .history = .init(allocator),
             .current_spans = .init(allocator),
@@ -1717,7 +1734,7 @@ pub const Editor = struct {
             .cached_prompt_metrics = .init(allocator),
             .old_prompt_metrics = .init(allocator),
             .cached_buffer_metrics = .init(allocator),
-            .event_loop = .init(allocator, configuration),
+            .event_loop = .init(allocator, io, configuration),
         };
     }
 
@@ -1755,24 +1772,24 @@ pub const Editor = struct {
     pub const AddToHistoryError = std.mem.Allocator.Error;
 
     pub fn addToHistory(self: *Self, line: []const u8) !void {
-        const entry: HistoryEntry = try .init(self.allocator, line);
+        const entry: HistoryEntry = try .init(self.allocator, self.io, line);
         try self.history.container.append(entry);
     }
 
     pub const LoadHistoryError =
         std.mem.Allocator.Error ||
-        std.fs.File.OpenError ||
-        std.fs.File.ReadError;
+        std.Io.File.OpenError ||
+        std.Io.File.Reader.Error;
 
     pub fn loadHistory(self: *Self, path: []const u8) LoadHistoryError!void {
-        var history_file = std.fs.cwd().openFile(path, .{}) catch |err| switch (err) {
+        var history_file = std.Io.Dir.cwd().openFile(self.io, path, .{}) catch |err| switch (err) {
             error.FileNotFound => return,
             else => return err,
         };
-        defer history_file.close();
+        defer history_file.close(self.io);
 
         var buffer: [1024]u8 = undefined;
-        var history_file_reader = history_file.reader(&buffer);
+        var history_file_reader = history_file.reader(self.io, &buffer);
         const reader = &history_file_reader.interface;
 
         const data = reader.allocRemaining(self.allocator, .unlimited) catch |err| switch (err) {
@@ -1787,31 +1804,31 @@ pub const Editor = struct {
                 continue;
             }
 
-            const entry_start = std.mem.indexOf(u8, str, "::") orelse 0;
-            const timestamp = std.fmt.parseInt(i64, str[0..entry_start], 10) catch 0;
+            const entry_start = std.mem.find(u8, str, "::") orelse 0;
+            const timestamp_seconds = std.fmt.parseInt(i64, str[0..entry_start], 10) catch 0;
             const entry = try HistoryEntry.initWithTimestamp(
                 self.allocator,
                 str[(if (entry_start == 0) 0 else entry_start + 2)..],
-                timestamp,
+                .fromNanoseconds(timestamp_seconds * std.time.ns_per_s),
             );
             try self.history.container.append(entry);
         }
     }
 
     pub const SaveHistoryError =
-        std.fs.File.OpenError ||
-        std.fs.File.WriteError;
+        std.Io.File.OpenError ||
+        std.Io.File.Writer.Error;
 
     pub fn saveHistory(self: *Self, path: []const u8) SaveHistoryError!void {
-        var history_file = try std.fs.cwd().createFile(path, .{});
-        defer history_file.close();
+        var history_file = try std.Io.Dir.cwd().createFile(self.io, path, .{});
+        defer history_file.close(self.io);
 
         var buffer: [1024]u8 = undefined;
-        var history_file_writer = history_file.writer(&buffer);
+        var history_file_writer = history_file.writer(self.io, &buffer);
         const writer = &history_file_writer.interface;
 
         for (self.history.container.items) |entry| {
-            writer.print("{d}::{s}\n\n", .{ entry.timestamp, entry.entry }) catch {
+            writer.print("{d}::{s}\n\n", .{ entry.timestamp.toSeconds(), entry.entry }) catch {
                 return history_file_writer.err.?;
             };
         }
@@ -1895,12 +1912,12 @@ pub const Editor = struct {
     }
 
     fn getLineNonInteractive(self: *Self, prompt: []const u8) ![]const u8 {
-        var stderr_writer = SystemCapabilities.stderr().writer(&.{});
+        var stderr_writer = SystemCapabilities.stderr().writer(self.io, &.{});
         var stderr = &stderr_writer.interface;
         try stderr.writeAll(prompt);
 
         var stdin_buffer: [1024]u8 = undefined;
-        var stdin_reader = SystemCapabilities.stdin().reader(&stdin_buffer);
+        var stdin_reader = SystemCapabilities.stdin().reader(self.io, &stdin_buffer);
         const stdin = &stdin_reader.interface;
 
         var allocating_writer: std.Io.Writer.Allocating = .init(self.allocator);
@@ -1933,14 +1950,19 @@ pub const Editor = struct {
 
     pub const GetLineError =
         InputError ||
+        std.Io.Cancelable ||
         std.Io.Reader.Error ||
         std.Io.Writer.Error ||
         std.mem.Allocator.Error ||
-        std.posix.PipeError ||
         std.posix.TermiosGetError ||
         std.posix.TermiosSetError ||
         std.Thread.SpawnError ||
-        error{ CodepointTooLarge, Utf8CannotEncodeSurrogateHalf };
+        error{ CodepointTooLarge, Utf8CannotEncodeSurrogateHalf } ||
+        switch (builtin.os.tag) {
+            .uefi => error{},
+            .windows => std.Io.Threaded.PipeError || SystemCapabilities.WindowsCreatePipeError,
+            else => std.Io.Threaded.PipeError,
+        };
 
     pub fn getLine(self: *Self, prompt: []const u8) GetLineError![]const u8 {
         if (self.configuration.operation_mode == .non_interactive) {
@@ -1983,7 +2005,7 @@ pub const Editor = struct {
             const old_lines = self.num_lines;
             self.getTerminalSize();
 
-            var stderr_writer = SystemCapabilities.stderr().writer(&.{});
+            var stderr_writer = SystemCapabilities.stderr().writer(self.io, &.{});
             const stderr = &stderr_writer.interface;
 
             if (self.configuration.enable_bracketed_paste) {
@@ -2003,7 +2025,7 @@ pub const Editor = struct {
                 try stderr.writeAll("\n");
             }
 
-            try vtMoveRelative(-@as(i64, @intCast(prompt_lines)), 0);
+            try vtMoveRelative(-@as(i64, @intCast(prompt_lines)), 0, stderr);
             _ = self.setOrigin(true);
 
             self.history_cursor = self.history.container.items.len;
@@ -2022,7 +2044,7 @@ pub const Editor = struct {
 
             while (true) {
                 if (!had_incomplete_data_at_start) {
-                    self.event_loop.pump();
+                    try self.event_loop.pump();
                 }
                 had_incomplete_data_at_start = false;
 
@@ -2108,7 +2130,7 @@ pub const Editor = struct {
         }
 
         {
-            var stderr_writer = SystemCapabilities.stderr().writer(&.{});
+            var stderr_writer = SystemCapabilities.stderr().writer(self.io, &.{});
             const stderr = &stderr_writer.interface;
             try stderr.writeAll("^C");
         }
@@ -2119,7 +2141,7 @@ pub const Editor = struct {
 
         {
             var stderr_buffer: [1024]u8 = undefined;
-            var stderr_writer = SystemCapabilities.stderr().writer(&stderr_buffer);
+            var stderr_writer = SystemCapabilities.stderr().writer(self.io, &stderr_buffer);
             const stderr = &stderr_writer.interface;
 
             try self.repositionCursor(stderr, true);
@@ -2310,8 +2332,7 @@ pub const Editor = struct {
     }
 
     pub fn clearLine(self: *Self) void {
-        _ = self;
-        var stderr_writer = SystemCapabilities.stderr().writer(&.{});
+        var stderr_writer = SystemCapabilities.stderr().writer(self.io, &.{});
         const stderr = &stderr_writer.interface;
         stderr.writeAll("\r\x1b[K") catch {};
     }
@@ -2524,7 +2545,7 @@ pub const Editor = struct {
         var stdin = SystemCapabilities.stdin();
 
         if (self.incomplete_data.container.items.len == 0) {
-            const nread = stdin.read(&keybuf) catch |err| {
+            const nread = stdin.readStreaming(self.io, &.{&keybuf}) catch |err| {
                 // Zig eats EINTR, so we'll have to delay resize handling until the next read.
                 self.finished = true;
                 self.input_error = toWrapped(InputError, err);
@@ -2826,7 +2847,7 @@ pub const Editor = struct {
                 const token_start = self.cursor;
 
                 var stderr_buffer: [1024]u8 = undefined;
-                var stderr_writer = SystemCapabilities.stderr().writer(&stderr_buffer);
+                var stderr_writer = SystemCapabilities.stderr().writer(self.io, &stderr_buffer);
                 const stderr = &stderr_writer.interface;
 
                 // Ask for completions on the first tab press only.
@@ -2966,7 +2987,7 @@ pub const Editor = struct {
 
         {
             var stderr_buffer: [1024]u8 = undefined;
-            var stderr_writer = SystemCapabilities.stderr().writer(&stderr_buffer);
+            var stderr_writer = SystemCapabilities.stderr().writer(self.io, &stderr_buffer);
             const stderr = &stderr_writer.interface;
 
             try self.repositionCursor(stderr, true);
@@ -3003,7 +3024,7 @@ pub const Editor = struct {
             more_junk_to_read = false;
             const rc = SystemCapabilities.poll(&pollfds, 1, 0);
             if (rc == 1 and pollfds[0].revents & SystemCapabilities.POLL_IN != 0) {
-                const nread = stdin.read(&buf) catch |err| {
+                const nread = stdin.readStreaming(self.io, &.{&buf}) catch |err| {
                     self.finished = true;
                     self.input_error = toWrapped(InputError, err);
                     return error.ReadFailure;
@@ -3023,7 +3044,7 @@ pub const Editor = struct {
             return fromWrapped(err);
         }
 
-        var stderr_writer = SystemCapabilities.stderr().writer(&.{});
+        var stderr_writer = SystemCapabilities.stderr().writer(self.io, &.{});
         const stderr = &stderr_writer.interface;
         try stderr.writeAll("\x1b[6n");
 
@@ -3044,7 +3065,7 @@ pub const Editor = struct {
 
         while (state != .saw_r) {
             var b: [1]u8 = .{0};
-            const length = try stdin.read(&b);
+            const length = try stdin.readStreaming(self.io, &.{&b});
             if (length == 0) {
                 logger.debug("Got EOF while reading DSR response", .{});
                 return error.Empty;
@@ -3199,7 +3220,7 @@ pub const Editor = struct {
             }
 
             if (!found) {
-                var stderr_writer = SystemCapabilities.stderr().writer(&.{});
+                var stderr_writer = SystemCapabilities.stderr().writer(self.io, &.{});
                 const stderr = &stderr_writer.interface;
                 stderr.writeAll("\x07") catch {};
             }
@@ -3265,7 +3286,7 @@ pub const Editor = struct {
         }
 
         var stderr_buffer: [1024]u8 = undefined;
-        var stderr_writer = SystemCapabilities.stderr().writer(&stderr_buffer);
+        var stderr_writer = SystemCapabilities.stderr().writer(self.io, &stderr_buffer);
         const stderr = &stderr_writer.interface;
         defer {
             self.shown_lines = self.currentPromptMetrics().linesWithAddition(self.cached_buffer_metrics, self.num_columns);
@@ -3462,7 +3483,7 @@ pub const Editor = struct {
             self.extra_forward_lines = @max(shown_lines - new_lines, self.extra_forward_lines);
         }
 
-        var stderr_writer = SystemCapabilities.stderr().writer(&.{});
+        var stderr_writer = SystemCapabilities.stderr().writer(self.io, &.{});
         const stderr = &stderr_writer.interface;
         try self.repositionCursor(stderr, true);
         const current_line = self.numLines();
@@ -3480,7 +3501,7 @@ pub const Editor = struct {
             }, self.suggestion_manager.last_shown_suggestion.style) catch {};
 
             if (try self.suggestion_display.cleanup()) {
-                var stderr_writer = SystemCapabilities.stderr().writer(&.{});
+                var stderr_writer = SystemCapabilities.stderr().writer(self.io, &.{});
                 const stderr = &stderr_writer.interface;
                 try self.repositionCursor(stderr, false);
                 self.refresh_needed = true;
@@ -3493,7 +3514,7 @@ pub const Editor = struct {
 
     fn reallyQuitEventLoop(self: *Self) !void {
         self.finished = false;
-        var stderr_writer = SystemCapabilities.stderr().writer(&.{});
+        var stderr_writer = SystemCapabilities.stderr().writer(self.io, &.{});
         const stderr = &stderr_writer.interface;
         try self.repositionCursor(stderr, true);
         try stderr.writeAll("\n");
@@ -3517,7 +3538,7 @@ pub const Editor = struct {
         try setTermios(self.default_termios);
         self.initialized = false;
         if (self.configuration.enable_bracketed_paste) {
-            var stderr_writer = SystemCapabilities.stderr().writer(&.{});
+            var stderr_writer = SystemCapabilities.stderr().writer(self.io, &.{});
             const stderr = &stderr_writer.interface;
             try stderr.writeAll("\x1b[?2004l");
         }
@@ -3626,7 +3647,7 @@ pub const Editor = struct {
             self.suggestion_display.lines = self.num_lines;
         }
         if (!is_windows) {
-            const ws = SystemCapabilities.getWinsize(SystemCapabilities.stdin().handle) catch {
+            const ws = SystemCapabilities.getWinsize(self.io) catch {
                 return;
             };
             self.num_columns = ws.col;
@@ -3649,7 +3670,7 @@ pub const Editor = struct {
     }
 
     pub fn clearScreen(self: *Self) bool {
-        var stderr_writer = SystemCapabilities.stderr().writer(&.{});
+        var stderr_writer = SystemCapabilities.stderr().writer(self.io, &.{});
         const stderr = &stderr_writer.interface;
         stderr.writeAll("\x1b[3J\x1b[H\x1b[2J") catch {};
 
@@ -3666,7 +3687,7 @@ pub const Editor = struct {
         }
 
         if (self.cursor == 0) {
-            var stderr_writer = SystemCapabilities.stderr().writer(&.{});
+            var stderr_writer = SystemCapabilities.stderr().writer(self.io, &.{});
             const stderr = &stderr_writer.interface;
             stderr.writeAll("\x07") catch {}; // \a BEL
             return false;
@@ -3685,7 +3706,7 @@ pub const Editor = struct {
         }
 
         if (self.cursor == self.buffer.size()) {
-            var stderr_writer = SystemCapabilities.stderr().writer(&.{});
+            var stderr_writer = SystemCapabilities.stderr().writer(self.io, &.{});
             const stderr = &stderr_writer.interface;
             stderr.writeAll("\x07") catch {}; // \a BEL
             return false;
@@ -3786,7 +3807,7 @@ pub const Editor = struct {
         self.prohibitInput();
         defer self.allowInput();
 
-        var stderr_writer = SystemCapabilities.stderr().writer(&.{});
+        var stderr_writer = SystemCapabilities.stderr().writer(self.io, &.{});
         const stderr = &stderr_writer.interface;
         stderr.writeAll("<EOF>\n") catch {};
         if (!self.always_refresh) {
