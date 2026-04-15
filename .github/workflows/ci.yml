@@ -10,20 +10,20 @@ jobs:
   check-format:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
       - uses: mlugg/setup-zig@v2
         with:
-          version: 0.15.1
+          version: 0.16.0
       - name: Check format
         run: zig fmt --check src
 
   build-native:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
       - uses: mlugg/setup-zig@v2
         with:
-          version: 0.15.1
+          version: 0.16.0
       - name: Build
         run: zig build
 
@@ -33,10 +33,10 @@ jobs:
       matrix:
         target: [ "x86_64-linux-musl", "aarch64-macos-none", "x86-windows-gnu", "x86_64-uefi-gnu" ]
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
       - uses: mlugg/setup-zig@v2
         with:
-          version: 0.15.1
+          version: 0.16.0
       - name: Build
         run: zig build -Dtarget=${{ matrix.target }}
 
