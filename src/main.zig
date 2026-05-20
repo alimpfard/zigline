@@ -24,7 +24,7 @@ const Module = @This();
 
 fn Wrapped(comptime T: type) type {
     return struct {
-        value: std.meta.Int(.unsigned, @bitSizeOf(T)),
+        value: @Int(.unsigned, @bitSizeOf(T)),
         const t = T;
     };
 }
