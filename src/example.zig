@@ -3,7 +3,7 @@ const uefi = @import("uefi.zig");
 const std = @import("std");
 const builtin = @import("builtin");
 
-pub const std_options: std.Options = switch (builtin.os.tag) {
+pub const std_options: std.Options = switch (builtin.target.os.tag) {
     .uefi => .{
         // std.log does not work on UEFI (yet)
         .logFn = struct {
@@ -18,7 +18,7 @@ pub const std_options: std.Options = switch (builtin.os.tag) {
     else => .{},
 };
 
-pub const main = switch (builtin.os.tag) {
+pub const main = switch (builtin.target.os.tag) {
     .uefi => mainUefi,
     else => mainGeneric,
 };
