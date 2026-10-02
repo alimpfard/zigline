@@ -12,8 +12,8 @@ const Queue = sane.Queue;
 const StringBuilder = sane.StringBuilder;
 
 const builtin = @import("builtin");
-const is_windows = builtin.os.tag == .windows;
-const should_enable_signal_handling = switch (builtin.os.tag) {
+const is_windows = builtin.target.os.tag == .windows;
+const should_enable_signal_handling = switch (builtin.target.os.tag) {
     .windows, .wasi, .uefi => false,
     else => true,
 };
@@ -37,7 +37,7 @@ fn toWrapped(comptime T: type, value: anytype) Wrapped(T) {
     return .{ .value = @intFromError(@as(T, @errorCast(value))) };
 }
 
-pub const SystemCapabilities = switch (builtin.os.tag) {
+pub const SystemCapabilities = switch (builtin.target.os.tag) {
     // FIXME: Windows' console handling is a mess, and std doesn't have
     //        the necessary bindings to emulate termios on Windows.
     //        For now, we just ignore the termios problem, which will lead to
@@ -82,7 +82,7 @@ pub const SystemCapabilities = switch (builtin.os.tag) {
         };
 
         pub fn getWinsize(io: std.Io) !winsize {
-            switch (builtin.os.tag) {
+            switch (builtin.target.os.tag) {
                 .windows => {
                     const file = stderr();
                     var get_console_info = std.os.windows.CONSOLE.USER_IO.GET_SCREEN_BUFFER_INFO;
@@ -128,7 +128,7 @@ pub const SystemCapabilities = switch (builtin.os.tag) {
         pub const POLL_IN: i16 = 256;
 
         pub fn setPollFd(p: *Self.pollfd, f: anytype) void {
-            switch (builtin.os.tag) {
+            switch (builtin.target.os.tag) {
                 .windows => p.fd = @ptrCast(f),
                 .wasi => p.fd = f,
                 else => comptime unreachable,
@@ -146,7 +146,7 @@ pub const SystemCapabilities = switch (builtin.os.tag) {
         pub const WindowsCreatePipeError = error{ AccessDenied, NoDevice, FileNotFound, IsDir, NotDir, BadPathName, SystemResources, Unexpected, Canceled };
 
         pub fn pipe() ![2]std.posix.fd_t {
-            switch (builtin.os.tag) {
+            switch (builtin.target.os.tag) {
                 .windows => {
                     const threaded = std.Io.Threaded.global_single_threaded;
                     return threaded.windowsCreatePipe(.{
@@ -325,7 +325,7 @@ pub const SystemCapabilities = switch (builtin.os.tag) {
         }
 
         pub fn getTermiosCC(t: Self.termios, cc: Self.V) u8 {
-            return t.cc[@intFromEnum(cc)];
+            return t.cc[@backingInt(cc)];
         }
 
         pub const POLL_IN = std.posix.POLL.IN;
@@ -387,7 +387,7 @@ fn utf8ValidRange(s: []const u8) usize {
     while (i < s.len) {
         // Fast path for ASCII sequences
         while (i + N <= s.len) : (i += N) {
-            const v = std.mem.readInt(usize, s[i..][0..N], builtin.cpu.arch.endian());
+            const v = std.mem.readInt(usize, s[i..][0..N], builtin.target.cpu.arch.endian());
             if (v & MASK != 0) break;
             len += N;
         }
@@ -470,15 +470,13 @@ pub const Style = struct {
                     if (xterm == .unchanged) {
                         return "";
                     }
-                    return try std.fmt.allocPrint(
-                        allocator,
+                    return allocator.print(
                         "\x1b[{d}m",
-                        .{@intFromEnum(xterm) + @as(u8, if (role == .background) 40 else 30)},
+                        .{@backingInt(xterm) + @as(u8, if (role == .background) 40 else 30)},
                     );
                 },
                 .rgb => |rgb| {
-                    return try std.fmt.allocPrint(
-                        allocator,
+                    return allocator.print(
                         "\x1b[{};2;{d};{d};{d}m",
                         .{ @as(u8, if (role == .background) 48 else 38), rgb[0], rgb[1], rgb[2] },
                     );
@@ -1199,7 +1197,7 @@ var signalHandlingData: ?struct {
         var buffer: [4]u8 = undefined;
         var file_writer = file.writerStreaming(io, &buffer);
         const writer = &file_writer.interface;
-        writer.writeInt(u32, @intFromEnum(sig), .little) catch {};
+        writer.writeInt(u32, @backingInt(sig), .little) catch {};
     }
 } = null;
 
@@ -1331,7 +1329,7 @@ pub const Editor = struct {
         std.Io.Writer.Error ||
         std.mem.Allocator.Error ||
         error{ Empty, Eof, SystemResource } ||
-        switch (builtin.os.tag) {
+        switch (builtin.target.os.tag) {
             .uefi => error{},
             else => std.Io.Threaded.PipeError,
         };
@@ -1412,7 +1410,7 @@ pub const Editor = struct {
     configuration: Configuration,
     event_loop: Loop,
 
-    const Loop = if (builtin.os.tag == .wasi or builtin.os.tag == .uefi)
+    const Loop = if (builtin.target.os.tag == .wasi or builtin.target.os.tag == .uefi)
         struct {
             pub fn init(allocator: Allocator, io: std.Io, configuration: Configuration) Loop {
                 _ = allocator;
@@ -1958,7 +1956,7 @@ pub const Editor = struct {
         std.posix.TermiosSetError ||
         std.Thread.SpawnError ||
         error{ CodepointTooLarge, Utf8CannotEncodeSurrogateHalf } ||
-        switch (builtin.os.tag) {
+        switch (builtin.target.os.tag) {
             .uefi => error{},
             .windows => std.Io.Threaded.PipeError || SystemCapabilities.WindowsCreatePipeError,
             else => std.Io.Threaded.PipeError,
@@ -2658,7 +2656,7 @@ pub const Editor = struct {
 
                         var modifiers: CSIMod = .none;
                         if (param2 != 0) {
-                            modifiers = @enumFromInt(@as(u8, @intCast(param2 - 1)));
+                            modifiers = @fromBackingInt(@intCast(param2 - 1));
                         }
 
                         if (is_in_paste and code_point != '~' and param1 != 201) {
@@ -3401,10 +3399,10 @@ pub const Editor = struct {
 
         const InnerT = @TypeOf(handler.*);
 
-        inline for (@typeInfo(InnerT).@"struct".decls) |decl| {
-            const h = &@field(self.on, decl.name);
+        inline for (@typeInfo(InnerT).@"struct".decl_names) |decl_name| {
+            const h = &@field(self.on, decl_name);
             h.* = .{
-                .f = &@TypeOf(h.*.?).makeHandler(T, InnerT, decl.name).theHandler,
+                .f = &@TypeOf(h.*.?).makeHandler(T, InnerT, decl_name).theHandler,
                 .context = handler,
             };
         }
